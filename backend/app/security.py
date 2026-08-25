@@ -27,7 +27,7 @@ ALLOWED_TABLES = {
     "grades_summary",
 }
 
-FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date"}
+FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date", "email"}
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
