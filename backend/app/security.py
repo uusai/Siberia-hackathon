@@ -1,12 +1,3 @@
-"""Модуль безопасности для выполнения SQL-запросов.
-
-Политика:
-- Разрешены ТОЛЬКО SELECT-запросы.
-- Имена таблиц должны входить в whitelist (разрешённые таблицы).
-- К запросу автоматически добавляется LIMIT (если не указан).
-- Перед выполнением применяется statement_timeout (защита от долгих запросов).
-"""
-
 import os
 import re
 import subprocess
@@ -27,9 +18,7 @@ def _load_dotenv(path: str = ".env") -> None:
 _load_dotenv()
 
 
-# Whitelist разрешённых таблиц/представлений (схема 'assistant' БД vesna-db9)
 ALLOWED_TABLES = {
-    # открытые справочники
     "faculties", "departments", "programs", "curricula", "curriculum",
     "subjects", "teachers", "administration", "rooms", "schedule",
     "groups", "admission_campaigns",
@@ -38,23 +27,12 @@ ALLOWED_TABLES = {
     "grades_summary",
 }
 
-# Колонки с персональными данными, которые запрещено возвращать в любом виде.
-# ФИО (full_name/first_name/last_name/middle_name/applicant_name) и email не
-# включены сюда: они legit-но существуют в таблицах teachers/administration
-# (где показывать имена разрешено правилами кейса), а таблицы students/
-# applications/applicants, где эти поля были персональными, уже полностью
-# блокируются на уровне whitelist таблиц (_assert_whitelist_tables). Здесь
-# оставлены passport/phone/birth_date как доп. защита (defense-in-depth) —
-# на случай если whitelist таблиц в будущем изменится.
 FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date"}
 
-# Максимальное число возвращаемых строк (если LIMIT не указан)
 DEFAULT_LIMIT = 5
 
-# Таймаут выполнения запроса в миллисекундах (например, 5000 = 5 сек)
 STATEMENT_TIMEOUT_MS = int(os.getenv("SQL_STATEMENT_TIMEOUT_MS", "5000"))
 
-# Параметры подключения к БД
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
@@ -63,11 +41,10 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 
 class SQLSecurityError(Exception):
-    """Исключение при нарушении политики безопасности SQL."""
+    pass
 
 
 def _normalize_sql(sql: str) -> str:
-    """Убирает комментарии, завершающую ; и лишние пробелы."""
     sql = re.sub(r"--[^\n]*", " ", sql)
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     sql = " ".join(sql.split())
@@ -75,8 +52,6 @@ def _normalize_sql(sql: str) -> str:
 
 
 def _assert_select_only(sql: str) -> None:
-    """Проверяет, что запрос начинается со SELECT/WITH и не содержит
-    запрещённых конструкций (INSERT/UPDATE/DELETE/DROP и т.п.)."""
     lowered = sql.lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         raise SQLSecurityError("Разрешены только SELECT-запросы.")
@@ -87,7 +62,6 @@ def _assert_select_only(sql: str) -> None:
         "exec", "execute", "commit", "rollback", "vacuum", "reindex",
         "copy", "lock", "comment",
     ]
-    # Ищем запрещённые слова как отдельные токены
     tokens = re.findall(r"[a-zA-Z_]+", lowered)
     for word in forbidden:
         if word in tokens:
@@ -97,8 +71,6 @@ def _assert_select_only(sql: str) -> None:
 
 
 def _assert_whitelist_tables(sql: str) -> None:
-    """Проверяет, что все упомянутые в FROM/JOIN таблицы входят в whitelist."""
-    # Находим все идентификаторы после FROM / JOIN
     pattern = re.compile(
         r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?",
         re.IGNORECASE,
@@ -115,8 +87,6 @@ def _assert_whitelist_tables(sql: str) -> None:
 
 
 def _assert_no_forbidden_columns(sql: str) -> None:
-    """Проверяет, что запрос не упоминает колонки с персональными данными
-    (ФИО, паспорт, телефон, email, дата рождения и т.п.)."""
     tokens = re.findall(r"[a-zA-Z_]+", sql.lower())
     found = set(tokens) & FORBIDDEN_COLUMNS
     if found:
@@ -126,18 +96,12 @@ def _assert_no_forbidden_columns(sql: str) -> None:
 
 
 def _ensure_limit(sql: str) -> str:
-    """Добавляет LIMIT, если он не указан явно."""
     if re.search(r"\blimit\s+\d+", sql, re.IGNORECASE):
         return sql
     return f"{sql} LIMIT {DEFAULT_LIMIT}"
 
 
 def _assert_single_statement(sql: str) -> None:
-    """Запрещает несколько инструкций в одном запросе (через ';').
-
-    После нормализации разделитель ';' сохраняется. Допускаем
-    не более одного содержательного оператора (завершающий ';' игнорируем).
-    """
     statements = [s for s in sql.split(";") if s.strip()]
     if len(statements) > 1:
         raise SQLSecurityError(
@@ -146,11 +110,6 @@ def _assert_single_statement(sql: str) -> None:
 
 
 def validate_sql(sql: str) -> str:
-    """Проверяет SQL-запрос по политике безопасности и возвращает
-    безопасную (нормализованную) версию с добавленным LIMIT.
-
-    Выбрасывает SQLSecurityError при нарушении политики.
-    """
     normalized = _normalize_sql(sql)
     if not normalized:
         raise SQLSecurityError("Пустой SQL-запрос.")
@@ -163,20 +122,10 @@ def validate_sql(sql: str) -> str:
 
 
 def execute_sql(sql: str) -> str:
-    """Валидирует и выполняет SELECT-запрос через psql с statement_timeout.
-
-    Таймаут применяется через PGOPTIONS (передаётся серверу при подключении),
-    чтобы не смешивать SET с самим запросом в одном -c (иначе psql выводит
-    только подтверждение SET и теряет результат SELECT).
-
-    Возвращает текстовый результат выполнения запроса.
-    """
     safe_sql = validate_sql(sql)
 
     env = os.environ.copy()
     env["PGPASSWORD"] = DB_PASSWORD
-    # statement_timeout задаётся в миллисекундах; search_path=assistant,
-    # чтобы запросы без явного указания схемы шли в схему assistant (с данными).
     env["PGOPTIONS"] = (
         f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c search_path=assistant"
     )
@@ -189,9 +138,9 @@ def execute_sql(sql: str) -> str:
                 "-p", str(DB_PORT),
                 "-U", DB_USER,
                 "-d", DB_NAME,
-                "-t",          # без заголовков
-                "-A",          # невыровненный вывод
-                "-F", "|",     # разделитель полей
+                "-t",
+                "-A",
+                "-F", "|",
                 "-c", safe_sql,
             ],
             capture_output=True,

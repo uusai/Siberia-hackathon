@@ -1,35 +1,13 @@
-/* ═══════════════════════════════════════════════════════════════════════
-   ЭХОЛОТ — AI-ассистент университета · клиентская логика
-   ───────────────────────────────────────────────────────────────────────
-   Контракт с бэкендом намеренно минимальный:
-       POST /chat   →   { "question": "...", "role": "applicant" }
-       ответ        ←   { "answer": "текст" }
-   Поле `role` бэкенд может игнорировать (pydantic отбрасывает лишние поля).
-
-   Всё остальное — SQL-блок, разбор запроса и таблица результата — фронт
-   извлекает из САМОГО текста ответа. Если бэкенд вложил в answer блок
-   ```sql ...``` или строки вида «a|b|c» (ровно так psql -t -A -F'|'
-   возвращает данные в security.execute_sql), интерфейс покажет их как
-   подсвеченный SQL и настоящую <table>. Если пришёл обычный текст —
-   он просто отрисуется как сообщение.
-   ═══════════════════════════════════════════════════════════════════ */
-
 'use strict';
 
-/* ═══ 1. КОНФИГУРАЦИЯ ═════════════════════════════════════════════════ */
-
-const API_URL  = 'http://localhost:8000/chat';
-const API_BASE = API_URL.replace(/\/chat\/?$/, '');
+const API_BASE   = `${window.location.protocol}//${window.location.hostname}:8000`;
+const API_URL    = `${API_BASE}/chat`;
 const HEALTH_URL = `${API_BASE}/health`;
 
-const REQUEST_TIMEOUT_MS = 90_000;   // ответ = LLM + SQL + LLM, бывает долго
+const REQUEST_TIMEOUT_MS = 90_000;
 const HEALTH_EVERY_MS    = 25_000;
-const HISTORY_LIMIT      = 40;       // сообщений в localStorage
+const HISTORY_LIMIT      = 40;
 const STORE_KEY          = 'echolot:v1';
-
-/* ═══ 2. РОЛИ И ПРЕСЕТЫ ═══════════════════════════════════════════════
-   Вопросы взяты из раздела «Примеры бизнес-запросов» памятки участника.
-   ═══════════════════════════════════════════════════════════════════ */
 
 const ROLES = [
   {
@@ -82,15 +60,12 @@ const ROLES = [
   }
 ];
 
-/* Стадии пайплайна для индикатора-сонара. */
 const SONAR_STEPS = [
   { text: 'Читаю схему базы данных',       at: 0 },
   { text: 'Генерирую SQL-запрос',          at: 700 },
   { text: 'Проверяю политику безопасности', at: 1800 },
   { text: 'Выполняю запрос в PostgreSQL',  at: 3100 }
 ];
-
-/* ═══ 3. DOM ══════════════════════════════════════════════════════════ */
 
 const $ = (id) => document.getElementById(id);
 
@@ -115,11 +90,9 @@ const dom = {
   widgetClose:$('widgetClose')
 };
 
-/* ═══ 4. СОСТОЯНИЕ ════════════════════════════════════════════════════ */
-
 const state = {
   roleId: ROLES[0].id,
-  history: [],        // [{ who: 'user'|'bot'|'error', text, ts }]
+  history: [],
   busy: false
 };
 
@@ -139,7 +112,6 @@ function loadState() {
         .slice(-HISTORY_LIMIT);
     }
   } catch {
-    /* повреждённое хранилище не должно ломать приложение */
   }
 }
 
@@ -150,14 +122,9 @@ function saveState() {
       history: state.history.slice(-HISTORY_LIMIT)
     }));
   } catch {
-    /* приватный режим — просто работаем без сохранения */
   }
 }
 
-/* ═══ 5. УТИЛИТЫ ══════════════════════════════════════════════════════ */
-
-/** Экранирует символы, значимые для HTML. Всё, что пришло от LLM,
- *  проходит через неё либо вставляется через textContent. */
 function esc(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -181,7 +148,6 @@ function clockLabel(ts) {
   return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 }
 
-/** Значение выглядит числом (для выравнивания колонки вправо). */
 function isNumeric(value) {
   const v = String(value).trim()
     .replace(/[\s ]/g, '')   // пробелы-разделители разрядов, в т.ч. неразрывные
@@ -212,12 +178,10 @@ function splitRow(line) {
   return s.split('|').map((c) => c.trim());
 }
 
-/** Строка похожа на строку таблицы, а не на прозу с вертикальной чертой. */
 function looksTabular(line) {
   if (!line.includes('|')) return false;
   const cells = splitRow(line);
   if (cells.length < 2) return false;
-  // В прозе ячейки длинные и содержат точки-разделители предложений.
   return cells.every((c) => c.length <= 60 && !/\.\s/.test(c));
 }
 
@@ -232,7 +196,6 @@ function parseAnswer(raw) {
   const text = String(raw ?? '').replace(/\r\n/g, '\n').trim();
   if (!text) return blocks;
 
-  // 6.1 — сначала вынимаем ограждённые блоки кода
   const fence = /```([a-zA-Z]*)\r?\n?([\s\S]*?)```/g;
   let cursor = 0;
   let match;
@@ -253,7 +216,6 @@ function parseAnswer(raw) {
 
   return blocks;
 
-  // 6.2 — в обычном тексте ищем таблицы и «голый» SQL
   function pushProse(chunk) {
     const body = chunk.replace(/^\n+|\n+$/g, '');
     if (!body.trim()) return;
@@ -271,7 +233,6 @@ function parseAnswer(raw) {
     while (i < lines.length) {
       const line = lines[i];
 
-      // Незакрытый / неразмеченный SQL, начинающийся с новой строки
       if (/^\s*(SELECT|WITH)\b/i.test(line) && /\bFROM\b/i.test(lines.slice(i, i + 6).join(' '))) {
         const sqlLines = [];
         while (i < lines.length && lines[i].trim() !== '') {
@@ -284,7 +245,6 @@ function parseAnswer(raw) {
         continue;
       }
 
-      // Блок табличных строк
       if (looksTabular(line)) {
         const run = [];
         while (i < lines.length && looksTabular(lines[i])) { run.push(lines[i]); i++; }
@@ -302,11 +262,9 @@ function parseAnswer(raw) {
   }
 }
 
-/** Собирает блок таблицы из набора строк. Возвращает null, если не вышло. */
 function buildTable(run) {
   const lines = run.slice();
 
-  // Markdown-разделитель ниже заголовка → первая строка это шапка
   let columns = null;
   if (lines.length >= 2 && MD_SEPARATOR.test(lines[1])) {
     columns = splitRow(lines[0]);
@@ -316,15 +274,12 @@ function buildTable(run) {
   let rows = lines.map(splitRow).filter((r) => r.some((c) => c !== ''));
   if (!rows.length && !columns) return null;
 
-  // Одиночная строка без шапки — скорее проза, чем таблица
   if (!columns && rows.length < 2) return null;
 
-  // Ширина колонок должна быть согласованной
   const width = Math.max(columns ? columns.length : 0, ...rows.map((r) => r.length));
   const consistent = rows.every((r) => Math.abs(r.length - width) <= 1);
   if (!consistent) return null;
 
-  // Шапки не было, но первая строка выглядит как заголовки
   if (!columns && rows.length >= 2) {
     const head = rows[0];
     const headIsText = head.every((c) => c !== '' && !isNumeric(c));
@@ -399,9 +354,6 @@ function highlightSql(sql) {
   });
 }
 
-/* ═══ 8. РЕНДЕР ═══════════════════════════════════════════════════════ */
-
-/** Лёгкий markdown: **жирный**, `код`, маркированные и нумерованные списки. */
 function renderProse(text) {
   const frag = document.createDocumentFragment();
   const lines = text.split('\n');
@@ -445,7 +397,6 @@ function renderProse(text) {
   return frag;
 }
 
-/** Раскрывающийся блок SQL + бейджи объяснения. */
 function renderSqlBlock(sql) {
   const info = explainSql(sql);
 

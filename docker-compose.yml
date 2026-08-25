@@ -8,3 +8,19 @@ services:
       - ./backend:/app
     env_file:
       - .env
+    networks:
+      - hackathon_net
+
+  frontend:
+    build: ./frontend
+    container_name: hackathon_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - hackathon_net
+
+networks:
+  hackathon_net:
+    driver: bridge

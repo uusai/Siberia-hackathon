@@ -6,7 +6,7 @@ import subprocess
 import urllib.request
 import urllib.error
 
-from . import security  # модуль безопасности SQL-запросов
+from . import security
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -32,17 +32,12 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 SYSTEM_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT")
 API_URL = os.getenv("API_URL")
 
-# Параметры подключения к БД
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Ручной fallback со связями между таблицами — используется только если
-# get_db_relationships() вернула пустую строку (в БД FK не объявлены как
-# constraints, что часто бывает в тестовых БД хакатонов, даже если связи
-# логически существуют).
 MANUAL_RELATIONSHIPS_FALLBACK = """Связи между таблицами (foreign keys) — заданы вручную, так как в БД они не объявлены как constraints:
 - curriculum.program_id -> programs.id
 - curriculum.subject_id -> subjects.id
@@ -68,10 +63,6 @@ def build_model_uri() -> str:
 
 
 def get_db_schema() -> str:
-    """Получает список таблиц и их колонок из БД через psql.
-
-    Используется схема 'assistant' (в ней находятся заполненные таблицы).
-    """
     query = (
         "SELECT table_name, column_name, data_type "
         "FROM information_schema.columns "
@@ -88,9 +79,9 @@ def get_db_schema() -> str:
                 "-p", str(DB_PORT),
                 "-U", DB_USER,
                 "-d", DB_NAME,
-                "-t",          # только кортежи, без заголовков
-                "-A",          # невыровненный вывод
-                "-F", "|",     # разделитель полей
+                "-t",
+                "-A",
+                "-F", "|",
                 "-c", query,
             ],
             capture_output=True,
@@ -104,7 +95,6 @@ def get_db_schema() -> str:
     if result.returncode != 0:
         return f"[Ошибка получения схемы БД] {result.stderr.strip()}"
 
-    # Группируем колонки по таблицам
     tables: dict[str, list[str]] = {}
     for line in result.stdout.splitlines():
         line = line.strip()
@@ -126,7 +116,6 @@ def get_db_schema() -> str:
 
 
 def get_db_relationships() -> str:
-    """Получает список foreign key связей из БД через psql."""
     query = (
         "SELECT "
         "tc.table_name AS from_table, "
@@ -169,19 +158,11 @@ def get_db_relationships() -> str:
         lines.append(f"{from_table}.{from_col} -> {to_table}.{to_col}")
 
     if not lines:
-        return ""  # пусто — вызывающий код должен использовать fallback
+        return ""
     return "Связи между таблицами (foreign keys):\n" + "\n".join(f"- {l}" for l in lines)
 
 
-# ---------------------------------------------------------------------------
-# Фаза 1: генерация SQL
-# ---------------------------------------------------------------------------
-
 def build_sql_system_prompt() -> str:
-    """Системный промпт для генерации SQL.
-
-    Модель получает схему БД и должна выдать ТОЛЬКО SELECT-запрос.
-    """
     schema = get_db_schema()
     relationships = get_db_relationships()
     if not relationships:
@@ -231,37 +212,21 @@ def build_sql_system_prompt() -> str:
 
 
 def extract_sql(text: str) -> str | None:
-    """Извлекает SQL-запрос из ответа модели.
-
-    Поддерживаются варианты:
-    - чистый SQL без обёртки
-    - SQL внутри блока ```sql ... ```
-    """
     text = text.strip()
 
-    # SQL внутри markdown-блока (приоритет)
     fence = re.search(r"```(?:sql)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
         if candidate:
             return candidate
 
-    # Иначе считаем, что весь ответ — это SQL (убираем лишний мусор)
     match = re.search(r"(SELECT|WITH)\s.+", text, re.IGNORECASE | re.DOTALL)
     if match:
         return match.group(0).strip().rstrip(";")
     return None
 
 
-# ---------------------------------------------------------------------------
-# Фаза 2: объяснение результата БД на человеческом языке
-# ---------------------------------------------------------------------------
-
 def build_interpret_system_prompt() -> str:
-    """Системный промпт для интерпретации результата БД.
-
-    Модель НЕ имеет схемы и не генерирует SQL — только объясняет данные.
-    """
     return (
         f"{SYSTEM_PROMPT}\n\n"
         f"Ты — помощник, который объясняет результаты запросов к базе данных "
@@ -277,12 +242,7 @@ def build_interpret_system_prompt() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Обращение к Yandex GPT
-# ---------------------------------------------------------------------------
-
 def call_gpt(system_text: str, user_text: str) -> str:
-    """Делает один вызов к API Yandex GPT и возвращает текст ответа."""
     messages = [
         {"role": "system", "text": system_text},
         {"role": "user", "text": user_text},
@@ -325,16 +285,11 @@ def call_gpt(system_text: str, user_text: str) -> str:
 
 
 def run_sql_through_security(sql: str) -> str:
-    """Передаёт SQL в security.py, возвращает результат БД или причину отказа."""
     try:
         return security.execute_sql(sql)
     except security.SQLSecurityError as e:
         return f"[Запрос отклонён проверкой безопасности] {e}"
 
-
-# ---------------------------------------------------------------------------
-# Основной цикл
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     global FOLDER_ID
@@ -351,7 +306,6 @@ def main() -> None:
     print("  Введите 'exit' или 'quit' для выхода")
     print("=" * 50)
 
-    # Системные промпты формируются один раз (схема БД кешируется)
     sql_system = build_sql_system_prompt()
     interpret_system = build_interpret_system_prompt()
 
@@ -371,7 +325,6 @@ def main() -> None:
             print("До свидания!")
             break
 
-        # --- Фаза 1: генерация SQL на основе вопроса пользователя ---
         print("Агент генерирует SQL-запрос...")
         sql_reply = call_gpt(sql_system, user_input)
 
@@ -383,12 +336,10 @@ def main() -> None:
 
         print(f"Сгенерирован SQL: {sql}")
 
-        # --- Проверка безопасности + отправка в БД ---
         print("Проверка в security.py и выполнение в БД...")
         db_result = run_sql_through_security(sql)
         print(f"Результат БД:\n{db_result}")
 
-        # --- Фаза 2: отдаём результат БД нейронке для расшифровки ---
         interpret_input = (
             f"Исходный вопрос пользователя:\n{user_input}\n\n"
             f"Выполненный SQL-запрос:\n{sql}\n\n"
