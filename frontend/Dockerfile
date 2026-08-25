@@ -4,6 +4,8 @@ COPY index.html /usr/share/nginx/html/index.html
 COPY script.js  /usr/share/nginx/html/script.js
 COPY style.css  /usr/share/nginx/html/style.css
 
+RUN chmod -R a+rX /usr/share/nginx/html
+
 EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]
