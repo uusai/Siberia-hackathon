@@ -13,21 +13,12 @@ import subprocess
 
 # Whitelist разрешённых таблиц/представлений (схема 'assistant' БД vesna-db9)
 ALLOWED_TABLES = {
-    "admission_campaigns",
-    "applications",
-    "audit_log",
-    "curriculum",
-    "departments",
-    "enrollments",
-    "faculties",
-    "grades",
-    "groups",
-    "programs",
-    "rooms",
-    "schedule",
-    "students",
-    "subjects",
-    "teachers",
+    # открытые справочники
+    "faculties", "departments", "programs", "curricula", "curriculum",
+    "subjects", "teachers", "administration", "rooms", "schedule",
+    "groups", "admission_campaigns",
+    "admissions_stats",
+    "students_summary", "applications_summary", "applicants_summary",
 }
 
 # Максимальное число возвращаемых строк (если LIMIT не указан)
