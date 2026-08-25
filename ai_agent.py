@@ -39,6 +39,29 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
+# Ручной fallback со связями между таблицами — используется только если
+# get_db_relationships() вернула пустую строку (в БД FK не объявлены как
+# constraints, что часто бывает в тестовых БД хакатонов, даже если связи
+# логически существуют).
+MANUAL_RELATIONSHIPS_FALLBACK = """Связи между таблицами (foreign keys) — заданы вручную, так как в БД они не объявлены как constraints:
+- curriculum.program_id -> programs.id
+- curriculum.subject_id -> subjects.id
+- curriculum.teacher_id -> teachers.id
+- groups.program_id -> programs.id
+- students.group_id -> groups.id
+- programs.faculty_id -> faculties.id
+- teachers.department_id -> departments.id
+- schedule.curriculum_id -> curriculum.id
+- schedule.room_id -> rooms.id
+- schedule.group_id -> groups.id
+- enrollments.student_id -> students.id
+- enrollments.curriculum_id -> curriculum.id
+- grades.enrollment_id -> enrollments.id
+- applications.campaign_id -> admission_campaigns.id
+- admission_campaigns.program_id -> programs.id
+- departments.faculty_id -> faculties.id
+- administration.faculty_id -> faculties.id"""
+
 
 def build_model_uri() -> str:
     return f"gpt://{FOLDER_ID}/{MODEL_NAME}"
@@ -102,6 +125,54 @@ def get_db_schema() -> str:
     return "\n".join(lines)
 
 
+def get_db_relationships() -> str:
+    """Получает список foreign key связей из БД через psql."""
+    query = (
+        "SELECT "
+        "tc.table_name AS from_table, "
+        "kcu.column_name AS from_column, "
+        "ccu.table_name AS to_table, "
+        "ccu.column_name AS to_column "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+        "JOIN information_schema.constraint_column_usage ccu "
+        "  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
+        "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'assistant' "
+        "ORDER BY tc.table_name;"
+    )
+    env = os.environ.copy()
+    env["PGPASSWORD"] = DB_PASSWORD
+    try:
+        result = subprocess.run(
+            [
+                "psql", "-h", DB_HOST, "-p", str(DB_PORT), "-U", DB_USER, "-d", DB_NAME,
+                "-t", "-A", "-F", "|", "-c", query,
+            ],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return f"[Не удалось получить связи БД] {e}"
+
+    if result.returncode != 0:
+        return f"[Ошибка получения связей БД] {result.stderr.strip()}"
+
+    lines = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 4:
+            continue
+        from_table, from_col, to_table, to_col = parts
+        lines.append(f"{from_table}.{from_col} -> {to_table}.{to_col}")
+
+    if not lines:
+        return ""  # пусто — вызывающий код должен использовать fallback
+    return "Связи между таблицами (foreign keys):\n" + "\n".join(f"- {l}" for l in lines)
+
+
 # ---------------------------------------------------------------------------
 # Фаза 1: генерация SQL
 # ---------------------------------------------------------------------------
@@ -112,11 +183,17 @@ def build_sql_system_prompt() -> str:
     Модель получает схему БД и должна выдать ТОЛЬКО SELECT-запрос.
     """
     schema = get_db_schema()
+    relationships = get_db_relationships()
+    if not relationships:
+        relationships = MANUAL_RELATIONSHIPS_FALLBACK
     return (
         f"{SYSTEM_PROMPT}\n\n"
         f"Ты — генератор SQL-запросов к базе данных университета. "
         f"Ниже реальная схема БД, используй ТОЛЬКО существующие таблицы и колонки.\n\n"
         f"{schema}\n\n"
+        f"Используй ТОЛЬКО эти связи для построения JOIN. Не соединяй одну и ту же "
+        f"таблицу саму с собой без явной необходимости.\n"
+        f"{relationships}\n\n"
         f"ПРАВИЛА:\n"
         f"1. Генерируй ТОЛЬКО SELECT-запросы (или WITH ... SELECT).\n"
         f"2. Не используй таблицы вне схемы и не-modify данные.\n"
@@ -137,6 +214,19 @@ def build_sql_system_prompt() -> str:
         f"status = 'active'. Тот же приём (SUM соответствующей count-колонки) "
         f"применяй к applications_summary (applications_count), "
         f"applicants_summary (applicants_count) и grades_summary (grades_count)."
+        f"6. students_summary теперь содержит: faculty_id, program_name, degree, "
+        f"status, funding, enrolled_year, student_count. "
+        f"degree — это уровень образования ('бакалавриат', 'магистратура'), "
+        f"funding — форма оплаты ('бюджет', 'контракт'). НЕ путай их. "
+        f"program_name — название направления, фильтруй через ILIKE '%текст%' "
+        f"для нечувствительности к регистру. Пример: чтобы узнать сколько студентов "
+        f"учится на юриспруденции на бакалавриате: "
+        f"SELECT SUM(student_count) FROM students_summary "
+        f"WHERE program_name ILIKE '%юриспруденция%' AND degree = 'бакалавриат'."
+        f"course — номер курса обучения (1 = первокурсники, 2, 3, 4). "
+        f"enrolled_year — календарный год поступления (например, 2024), "
+        f"это НЕ курс. Для вопросов про 'первокурсников' используй course = 1, "
+        f"НЕ enrolled_year = 1."
     )
 
 
