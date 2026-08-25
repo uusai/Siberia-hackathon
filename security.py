@@ -10,6 +10,22 @@
 import os
 import re
 import subprocess
+def _load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
+
+_load_dotenv()
+
 
 # Whitelist разрешённых таблиц/представлений (схема 'assistant' БД vesna-db9)
 ALLOWED_TABLES = {
@@ -18,8 +34,19 @@ ALLOWED_TABLES = {
     "subjects", "teachers", "administration", "rooms", "schedule",
     "groups", "admission_campaigns",
     "admissions_stats",
-    "students_summary", "applications_summary", "applicants_summary",
+    "students_summary", "applications_summary",
+    "grades_summary",
 }
+
+# Колонки с персональными данными, которые запрещено возвращать в любом виде.
+# ФИО (full_name/first_name/last_name/middle_name/applicant_name) и email не
+# включены сюда: они legit-но существуют в таблицах teachers/administration
+# (где показывать имена разрешено правилами кейса), а таблицы students/
+# applications/applicants, где эти поля были персональными, уже полностью
+# блокируются на уровне whitelist таблиц (_assert_whitelist_tables). Здесь
+# оставлены passport/phone/birth_date как доп. защита (defense-in-depth) —
+# на случай если whitelist таблиц в будущем изменится.
+FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date"}
 
 # Максимальное число возвращаемых строк (если LIMIT не указан)
 DEFAULT_LIMIT = 5
@@ -40,12 +67,11 @@ class SQLSecurityError(Exception):
 
 
 def _normalize_sql(sql: str) -> str:
-    """Убирает комментарии и лишние пробелы, приводит к единому виду."""
-    # Удаляем строчные -- комментарии
+    """Убирает комментарии, завершающую ; и лишние пробелы."""
     sql = re.sub(r"--[^\n]*", " ", sql)
-    # Удаляем блочные /* */ комментарии
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    return " ".join(sql.split())
+    sql = " ".join(sql.split())
+    return sql.rstrip(";").strip()
 
 
 def _assert_select_only(sql: str) -> None:
@@ -88,6 +114,17 @@ def _assert_whitelist_tables(sql: str) -> None:
             )
 
 
+def _assert_no_forbidden_columns(sql: str) -> None:
+    """Проверяет, что запрос не упоминает колонки с персональными данными
+    (ФИО, паспорт, телефон, email, дата рождения и т.п.)."""
+    tokens = re.findall(r"[a-zA-Z_]+", sql.lower())
+    found = set(tokens) & FORBIDDEN_COLUMNS
+    if found:
+        raise SQLSecurityError(
+            f"Query contains forbidden personal-data fields: {', '.join(sorted(found))}"
+        )
+
+
 def _ensure_limit(sql: str) -> str:
     """Добавляет LIMIT, если он не указан явно."""
     if re.search(r"\blimit\s+\d+", sql, re.IGNORECASE):
@@ -121,6 +158,7 @@ def validate_sql(sql: str) -> str:
     _assert_select_only(normalized)
     _assert_single_statement(normalized)
     _assert_whitelist_tables(normalized)
+    _assert_no_forbidden_columns(normalized)
     return _ensure_limit(normalized)
 
 

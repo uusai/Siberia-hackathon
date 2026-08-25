@@ -122,7 +122,21 @@ def build_sql_system_prompt() -> str:
         f"2. Не используй таблицы вне схемы и не-modify данные.\n"
         f"3. Если нужно много строк — добавь LIMIT (например, LIMIT 50).\n"
         f"4. В ответе выдай ЕДИНСТВЕННУЮ вещь — SQL в блоке ```sql ... ```. "
-        f"Никакого пояснительного текста до и после. Никакого другого текста."
+        f"Никакого пояснительного текста до и после. Никакого другого текста.\n"
+        f"5. Таблицы students, applications, applicants, grades и enrollments "
+        f"НАПРЯМУЮ недоступны (содержат персональные данные). Вместо них используй "
+        f"агрегированные представления students_summary, applications_summary, "
+        f"applicants_summary, grades_summary.\n"
+        f"   Например, students_summary сгруппирован по group_id/status/funding/"
+        f"enrolled_year и содержит колонку student_count (число студентов в каждой "
+        f"группе). Чтобы получить ОБЩЕЕ количество студентов, просуммируй эту колонку "
+        f"по всем группам: SELECT SUM(student_count) FROM students_summary. "
+        f"Чтобы получить количество по конкретному условию (например, status = "
+        f"'active'), добавь WHERE или GROUP BY по нужному полю и просуммируй "
+        f"student_count: SELECT SUM(student_count) FROM students_summary WHERE "
+        f"status = 'active'. Тот же приём (SUM соответствующей count-колонки) "
+        f"применяй к applications_summary (applications_count), "
+        f"applicants_summary (applicants_count) и grades_summary (grades_count)."
     )
 
 
