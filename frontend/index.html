@@ -1,19 +1,157 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <title>AI-ассистент университета</title>
-    <link rel="stylesheet" href="style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Эхолот — AI-ассистент университета. Задайте вопрос о данных вуза обычным языком и получите ответ, SQL-запрос и таблицу.">
+<meta name="color-scheme" content="light dark">
+<title>Эхолот — AI-ассистент университета</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Unbounded:wght@600&display=swap">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='3' fill='%2316C0D8'/><circle cx='16' cy='16' r='8' fill='none' stroke='%230E6E8C' stroke-width='2'/><circle cx='16' cy='16' r='13' fill='none' stroke='%230E6E8C' stroke-width='1.5' opacity='.45'/></svg>">
+<link rel="stylesheet" href="style.css">
 </head>
+
 <body>
-    <div class="chat-container">
-        <div class="chat-header">AI-ассистент</div>
-        <div class="chat-messages" id="messages"></div>
-        <div class="chat-input">
-            <input type="text" id="userInput" placeholder="Задайте вопрос..." autocomplete="off">
-            <button id="sendBtn">Отправить</button>
-        </div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     Кнопка-пузырь. Видна только во встраиваемом режиме (?embed=1)
+     ═══════════════════════════════════════════════════════════ -->
+<button class="widget-launcher" id="widgetLauncher" type="button"
+        aria-label="Открыть чат с ассистентом" aria-expanded="false">
+  <svg class="widget-launcher__icon" viewBox="0 0 32 32" aria-hidden="true">
+    <circle cx="16" cy="16" r="3"/>
+    <path d="M16 8a8 8 0 0 1 8 8" fill="none" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M16 3a13 13 0 0 1 13 13" fill="none" stroke-width="2" stroke-linecap="round" opacity=".5"/>
+  </svg>
+  <span class="widget-launcher__pulse" aria-hidden="true"></span>
+</button>
+
+<div class="app" id="app">
+
+  <!-- ═════════════════════════════════════════════════════════════
+       Боковая панель: бренд, роли, пресеты, политика данных, статус
+       ═════════════════════════════════════════════════════════ -->
+  <aside class="rail" id="rail">
+
+    <header class="rail__brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40">
+          <circle class="brand-mark__core" cx="20" cy="20" r="3.6"/>
+          <circle class="brand-mark__ring" cx="20" cy="20" r="9"  style="--i:0"/>
+          <circle class="brand-mark__ring" cx="20" cy="20" r="14" style="--i:1"/>
+          <circle class="brand-mark__ring" cx="20" cy="20" r="18.5" style="--i:2"/>
+        </svg>
+      </span>
+      <span class="brand-text">
+        <b class="brand-text__name">Эхолот</b>
+        <span class="brand-text__sub">данные университета</span>
+      </span>
+      <button class="rail__close" id="railClose" type="button" aria-label="Закрыть панель">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <div class="rail__scroll">
+
+      <!-- Роль пользователя -->
+      <section class="rail__block">
+        <h2 class="rail__title">Я в университете</h2>
+        <div class="roles" id="roles" role="radiogroup" aria-label="Категория пользователя"></div>
+      </section>
+
+      <!-- Пресеты вопросов под выбранную роль -->
+      <section class="rail__block">
+        <h2 class="rail__title">Попробуйте спросить</h2>
+        <ul class="presets" id="presets"></ul>
+      </section>
+
+      <!-- Политика персональных данных -->
+      <section class="rail__block">
+        <h2 class="rail__title">Политика данных</h2>
+        <ul class="policy">
+          <li class="policy__item policy__item--allow">
+            <span class="policy__mark" aria-hidden="true">✓</span>
+            <span>ФИО преподавателей, деканов и сотрудников</span>
+          </li>
+          <li class="policy__item policy__item--deny">
+            <span class="policy__mark" aria-hidden="true">✕</span>
+            <span>Персональные данные студентов и абитуриентов — только в агрегированном виде</span>
+          </li>
+        </ul>
+        <p class="policy__note">Вводить SQL не нужно и нельзя — ассистент понимает обычный русский язык.</p>
+      </section>
+
     </div>
-    <script src="script.js"></script>
+
+    <footer class="rail__foot">
+      <span class="status" id="status" data-state="checking">
+        <span class="status__dot" aria-hidden="true"></span>
+        <span class="status__text" id="statusText">Проверяю связь…</span>
+      </span>
+      <span class="rail__sign">Код Байкала · ИГУ</span>
+    </footer>
+  </aside>
+
+  <div class="rail-scrim" id="railScrim" hidden></div>
+
+  <!-- ═════════════════════════════════════════════════════════════
+       Чат
+       ═════════════════════════════════════════════════════════ -->
+  <main class="chat">
+
+    <header class="chat__bar">
+      <button class="icon-btn chat__menu" id="railOpen" type="button" aria-label="Открыть панель">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h14M3 10h14M3 14h14" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+
+      <div class="chat__id">
+        <h1 class="chat__name">AI-ассистент университета</h1>
+        <p class="chat__role" id="chatRole">режим: абитуриент</p>
+      </div>
+
+      <span class="status status--compact" id="statusMini" data-state="checking">
+        <span class="status__dot" aria-hidden="true"></span>
+      </span>
+
+      <button class="icon-btn" id="clearBtn" type="button" aria-label="Очистить историю" title="Очистить историю">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M4 6h12M8 6V4.5h4V6M6.5 6l.6 9.5h5.8L13.5 6" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+
+      <button class="icon-btn widget-only" id="widgetClose" type="button" aria-label="Свернуть чат">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <div class="thread" id="thread" role="log" aria-live="polite" aria-relevant="additions text"></div>
+
+    <!-- Пресеты дублируются над полем ввода на узких экранах -->
+    <div class="quick" id="quick" aria-label="Быстрые вопросы"></div>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="composer__field">
+        <label class="sr-only" for="userInput">Вопрос к ассистенту</label>
+        <textarea id="userInput" class="composer__input" rows="1" maxlength="600"
+                  placeholder="Спросите о данных университета…" enterkeyhint="send"></textarea>
+        <button class="composer__send" id="sendBtn" type="submit" aria-label="Отправить вопрос">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 11.5 20 4l-7.5 16-2-6.5-6.5-2z" stroke-width="1.7" stroke-linejoin="round" fill="none"/>
+          </svg>
+        </button>
+      </div>
+      <p class="composer__hint">
+        <kbd>Enter</kbd> — отправить · <kbd>Shift</kbd>+<kbd>Enter</kbd> — новая строка
+      </p>
+    </form>
+
+  </main>
+</div>
+
+<script src="script.js"></script>
 </body>
 </html>
