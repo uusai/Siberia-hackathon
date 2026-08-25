@@ -29,7 +29,8 @@ ALLOWED_TABLES = {
 
 FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date"}
 
-DEFAULT_LIMIT = 5
+DEFAULT_LIMIT = 25
+MAX_LIMIT = 200
 
 STATEMENT_TIMEOUT_MS = int(os.getenv("SQL_STATEMENT_TIMEOUT_MS", "5000"))
 
@@ -96,9 +97,13 @@ def _assert_no_forbidden_columns(sql: str) -> None:
 
 
 def _ensure_limit(sql: str) -> str:
-    if re.search(r"\blimit\s+\d+", sql, re.IGNORECASE):
-        return sql
-    return f"{sql} LIMIT {DEFAULT_LIMIT}"
+    match = re.search(r"\blimit\s+(\d+)", sql, re.IGNORECASE)
+    if not match:
+        return f"{sql} LIMIT {DEFAULT_LIMIT}"
+    requested = int(match.group(1))
+    if requested > MAX_LIMIT:
+        return re.sub(r"\blimit\s+\d+", f"LIMIT {MAX_LIMIT}", sql, flags=re.IGNORECASE)
+    return sql
 
 
 def _assert_single_statement(sql: str) -> None:
@@ -157,3 +162,82 @@ def execute_sql(sql: str) -> str:
         return f"[Ошибка БД] {result.stderr.strip()}"
 
     return result.stdout.strip()
+
+
+_AUDIT_NULL_SENTINEL = "\x01__AUDIT_NULL__\x01"
+
+
+def log_audit_entry(
+    username: str | None,
+    role: str | None,
+    question: str,
+    generated_sql: str | None,
+    executed_sql: str | None,
+    verdict: str,
+    reject_reason: str | None,
+    row_count: int | None,
+    duration_ms: int,
+    llm_ms: int,
+    model: str,
+) -> None:
+    def enc(value) -> str:
+        return _AUDIT_NULL_SENTINEL if value is None else str(value)
+
+    variables = {
+        "audit_username": enc(username),
+        "audit_role": enc(role),
+        "audit_question": enc(question),
+        "audit_generated_sql": enc(generated_sql),
+        "audit_executed_sql": enc(executed_sql),
+        "audit_verdict": enc(verdict),
+        "audit_reject_reason": enc(reject_reason),
+        "audit_row_count": enc(row_count),
+        "audit_duration_ms": enc(duration_ms),
+        "audit_llm_ms": enc(llm_ms),
+        "audit_model": enc(model),
+        "audit_null": _AUDIT_NULL_SENTINEL,
+    }
+
+    query = (
+        "INSERT INTO assistant.audit_log "
+        "(username, role, question, generated_sql, executed_sql, verdict, "
+        "reject_reason, row_count, duration_ms, llm_ms, model) VALUES ("
+        "NULLIF(:'audit_username', :'audit_null'), "
+        "NULLIF(:'audit_role', :'audit_null'), "
+        "NULLIF(:'audit_question', :'audit_null'), "
+        "NULLIF(:'audit_generated_sql', :'audit_null'), "
+        "NULLIF(:'audit_executed_sql', :'audit_null'), "
+        "NULLIF(:'audit_verdict', :'audit_null'), "
+        "NULLIF(:'audit_reject_reason', :'audit_null'), "
+        "NULLIF(:'audit_row_count', :'audit_null')::integer, "
+        "NULLIF(:'audit_duration_ms', :'audit_null')::integer, "
+        "NULLIF(:'audit_llm_ms', :'audit_null')::integer, "
+        "NULLIF(:'audit_model', :'audit_null')"
+        ");"
+    )
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = DB_PASSWORD
+    env["PGOPTIONS"] = "-c search_path=assistant"
+
+    cmd = [
+        "psql",
+        "-h", DB_HOST,
+        "-p", str(DB_PORT),
+        "-U", DB_USER,
+        "-d", DB_NAME,
+        "-v", "ON_ERROR_STOP=1",
+    ]
+    for key, value in variables.items():
+        cmd += ["-v", f"{key}={value}"]
+
+    result = subprocess.run(
+        cmd,
+        input=query,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
