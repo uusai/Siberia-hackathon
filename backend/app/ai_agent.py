@@ -29,7 +29,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 FOLDER_ID = os.getenv("FOLDER_ID")
 MODEL_NAME = os.getenv("MODEL_NAME")
-SYSTEM_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT")
+SYSTEM_PROMPT = "Отвечай пользователю на том же языке что он тебе пишет, при запросе пользователя по информации бд, не давай ему точные названия колонок или других данных, а переводи на язык пользователя и отвечай как человек."
 API_URL = os.getenv("API_URL")
 
 DB_HOST = os.getenv("DB_HOST")
