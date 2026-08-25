@@ -6,7 +6,7 @@ import subprocess
 import urllib.request
 import urllib.error
 
-import security  # модуль безопасности SQL-запросов
+from . import security  # модуль безопасности SQL-запросов
 
 
 def load_dotenv(path: str = ".env") -> None:
