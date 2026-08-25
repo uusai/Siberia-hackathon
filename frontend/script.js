@@ -584,7 +584,7 @@ function paintHello() {
 
   const eye = el('div', 'hello__sonar');
   eye.appendChild(svg(
-    '<circle cx="20" cy="20" r="3.6" fill="currentColor" stroke="none" style="color:var(--ice)"/>' +
+    '<circle cx="20" cy="20" r="3.6" fill="currentColor" stroke="none" style="color:var(--accent-glow)"/>' +
     '<circle class="brand-mark__ring" cx="20" cy="20" r="9"    style="--i:0"/>' +
     '<circle class="brand-mark__ring" cx="20" cy="20" r="14"   style="--i:1"/>' +
     '<circle class="brand-mark__ring" cx="20" cy="20" r="18.5" style="--i:2"/>',

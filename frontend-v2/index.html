@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="AI-ассистент университета — вопрос на естественном языке, безопасный SQL, ответ и таблица.">
+<meta name="color-scheme" content="dark">
+<title>AI-ассистент университета</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Raleway:wght@400&family=JetBrains+Mono:wght@400&display=swap">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23302f2c'/><circle cx='16' cy='16' r='7' fill='none' stroke='%23efede3' stroke-width='1.5'/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+
+<body data-screen="auth">
+
+<!-- ═══════════════════════════════════════════════════════════════
+     Иридесцентная атмосфера. Единственная цветная поверхность
+     в системе и только как медиа — никогда как заливка элементов.
+     ═══════════════════════════════════════════════════════════ -->
+<div class="iridescence" aria-hidden="true">
+  <span class="iridescence__flow iridescence__flow--a"></span>
+  <span class="iridescence__flow iridescence__flow--b"></span>
+  <span class="iridescence__grain"></span>
+</div>
+
+<!-- ═══ Верхняя панель ═══════════════════════════════════════════ -->
+<header class="topbar">
+  <div class="topbar__inner">
+    <a class="wordmark" href="#" aria-label="AI-ассистент университета">
+      <span class="wordmark__mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"/></svg>
+      </span>
+      <span class="wordmark__text">ассистент&nbsp;игу</span>
+    </a>
+
+    <nav class="topbar__session" id="session" hidden>
+      <span class="topbar__user" id="sessionUser"></span>
+      <span class="topbar__status" id="status" data-state="checking" title="Связь с сервером">
+        <span class="topbar__dot" aria-hidden="true"></span>
+        <span id="statusText">проверка</span>
+      </span>
+      <button class="pill-btn pill-btn--light" id="logoutBtn" type="button">Выйти</button>
+    </nav>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     ЭКРАН 1 — авторизация
+     ═══════════════════════════════════════════════════════════ -->
+<main class="auth" id="authScreen">
+  <div class="auth__inner">
+
+    <p class="eyebrow">Код Байкала · 2026</p>
+
+    <h1 class="auth__title">
+      AI-ассистент<br>университета
+    </h1>
+
+    <p class="auth__lead">
+      Задайте вопрос о данных вуза обычным языком. Система построит SQL-запрос,
+      проверит его на безопасность и вернёт ответ с таблицей.
+    </p>
+
+    <form class="auth__form" id="authForm" novalidate>
+      <div class="input-group">
+        <label class="input-group__label" for="login">Логин</label>
+        <input id="login" name="login" type="text" autocomplete="username"
+               placeholder="например, ivanov" required>
+      </div>
+
+      <div class="input-group">
+        <label class="input-group__label" for="password">Пароль</label>
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               placeholder="••••••••" required>
+      </div>
+
+      <p class="auth__error" id="authError" role="alert" hidden></p>
+
+      <button class="pill-btn pill-btn--dark auth__submit" type="submit">Войти</button>
+    </form>
+
+    <p class="auth__note">
+      Демонстрационный вход: подойдёт любая непустая пара логин / пароль.
+    </p>
+  </div>
+
+  <footer class="auth__foot">
+    <span>Иркутский государственный университет</span>
+    <span>Безопасный доступ к данным через естественный язык</span>
+  </footer>
+</main>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     ЭКРАН 2 — чат
+     ═══════════════════════════════════════════════════════════ -->
+<main class="chat" id="chatScreen" hidden>
+
+  <div class="chat__thread" id="thread" role="log" aria-live="polite" aria-relevant="additions">
+    <!-- Приветственный блок; заменяется историей после первого вопроса -->
+    <section class="intro" id="intro">
+      <p class="eyebrow">Начало диалога</p>
+      <h2 class="intro__title">Спросите о данных<br>университета</h2>
+
+      <ul class="intro__list">
+        <li><button class="intro__item" type="button">Сколько студентов обучается на каждом факультете?</button></li>
+        <li><button class="intro__item" type="button">Какой средний балл ЕГЭ у поступивших в 2025 году?</button></li>
+        <li><button class="intro__item" type="button">Сколько бюджетных мест осталось?</button></li>
+        <li><button class="intro__item" type="button">Какая кафедра имеет наибольшую учебную нагрузку?</button></li>
+      </ul>
+
+      <p class="intro__policy">
+        Персональные данные студентов и абитуриентов не выводятся —
+        только агрегированные и обезличенные показатели.
+      </p>
+    </section>
+  </div>
+
+  <div class="chat-loader" id="loader" aria-hidden="true">
+    <span class="loader-dot"></span>
+    <span class="loader-dot"></span>
+    <span class="loader-dot"></span>
+  </div>
+
+  <form class="composer" id="composer" autocomplete="off">
+    <div class="composer__inner">
+      <div class="input-group input-group--flush">
+        <label class="sr-only" for="messageInput">Вопрос к ассистенту</label>
+        <input id="messageInput" type="text" maxlength="600" placeholder="Ваш вопрос…" enterkeyhint="send">
+      </div>
+      <button class="pill-btn pill-btn--dark composer__send" id="sendBtn" type="submit">Спросить</button>
+    </div>
+  </form>
+
+</main>
+
+<script src="script.js"></script>
+</body>
+</html>
