@@ -55,6 +55,59 @@ def _load_dotenv(path: str = ".env") -> None:
         pass
 
 
+def _link_demo_people(conninfo: str) -> int:
+    """Привязывает демо-учётки к реальным людям в assistant.
+
+    Без привязки личные вьюхи my_* не вернут ничего: они фильтруются по
+    app.student_id, а брать его неоткуда. Выбираем не первого попавшегося,
+    а того, у кого больше всего оценок — чтобы на демо было что показать.
+    Запрос идемпотентен: проставляем связь только там, где её ещё нет.
+    """
+    picks = [
+        (
+            "student",
+            "student_id",
+            "SELECT s.id FROM assistant.students s "
+            "JOIN assistant.enrollments e ON e.student_id = s.id "
+            "JOIN assistant.grades g ON g.enrollment_id = e.id "
+            "WHERE s.status = 'учится' "
+            "GROUP BY s.id ORDER BY count(*) DESC, s.id LIMIT 1",
+        ),
+        (
+            "teacher",
+            "teacher_id",
+            "SELECT t.id FROM assistant.teachers t "
+            "JOIN assistant.curriculum c ON c.teacher_id = t.id "
+            "GROUP BY t.id ORDER BY count(*) DESC, t.id LIMIT 1",
+        ),
+    ]
+
+    print("\nПривязываю демо-учётки к людям в базе:")
+    failures = 0
+    for username, column, pick_sql in picks:
+        try:
+            with psycopg.connect(conninfo) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(pick_sql)
+                    row = cur.fetchone()
+                    if row is None:
+                        print(f"  [--]   {username}: подходящих записей нет, пропускаю")
+                        continue
+                    person_id = row[0]
+                    cur.execute(
+                        f"UPDATE auth.users SET {column} = %s "
+                        f"WHERE username = %s AND {column} IS NULL",
+                        (person_id, username),
+                    )
+                    changed = cur.rowcount
+            note = "привязан" if changed else "уже был привязан"
+            print(f"  [OK]   {username} -> {column}={person_id} ({note})")
+        except psycopg.Error as e:
+            print(f"  [FAIL] {username}: {str(e).strip()}", file=sys.stderr)
+            failures += 1
+    return failures
+
+
 def seed() -> int:
     _load_dotenv()
 
@@ -108,6 +161,8 @@ def seed() -> int:
                     failures += 1
                 else:
                     time.sleep(1)
+
+    failures += _link_demo_people(conninfo)
 
     print()
     print("=" * 70)

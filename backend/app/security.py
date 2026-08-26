@@ -42,15 +42,70 @@ _load_dotenv()
 # №N набрало 98 по химии» вместе с любой другой утечкой по applications
 # позволяет опознать человека. Агенту доступно только агрегированное
 # ege_scores_summary — тот же приём, что со students_summary.
-ALLOWED_TABLES = {
-    "faculties", "departments", "programs", "curriculum",
-    "subjects", "teachers", "rooms", "schedule",
-    "groups", "admission_campaigns",
-    "students_summary", "applications_summary", "grades_summary",
-    "ege_scores_summary",
+
+# Справочники и расписание: ничего личного, доступны любой роли.
+_BASE_TABLES = {
+    "faculties", "departments", "programs", "subjects", "teachers",
+    "rooms", "groups", "schedule", "admission_campaigns",
 }
 
+# Личные вьюхи студента. Они сами фильтруются по app.student_id, который
+# бэкенд выставляет из проверенного токена (см. sql/003_role_access.sql):
+# «свои данные» здесь — свойство самой вьюхи, а не обещание модели.
+STUDENT_PERSONAL_TABLES = {"my_profile", "my_grades", "my_schedule"}
+
+# Личные вьюхи преподавателя: что он ведёт, его расписание и успеваемость
+# по его предметам. Фильтруются по app.teacher_id — см. 004_teacher_views.sql.
+# Ролям выше (деканат, администрация) не выдаются: за ними не стоит
+# конкретный преподаватель, и такой запрос вернул бы им пустоту.
+TEACHER_PERSONAL_TABLES = {
+    "my_teaching", "my_teaching_schedule", "my_students_performance",
+}
+
+# Доступ накопительный: каждая следующая роль видит всё, что предыдущая.
+ALLOWED_TABLES_BY_ROLE: dict[str, set[str]] = {
+    "student": _BASE_TABLES | STUDENT_PERSONAL_TABLES,
+    "teacher": _BASE_TABLES | TEACHER_PERSONAL_TABLES | {
+        "curriculum", "grades_summary",
+    },
+    "deans-office": _BASE_TABLES | {
+        "curriculum", "grades_summary", "students_summary",
+    },
+    "administration": _BASE_TABLES | {
+        "curriculum", "grades_summary", "students_summary",
+        "applications_summary", "ege_scores_summary",
+    },
+}
+
+# Объединение по всем ролям — для мест, где роли нет: CLI-режим
+# ai_agent.main() и проверка «существует ли такая таблица вообще».
+ALLOWED_TABLES = set().union(*ALLOWED_TABLES_BY_ROLE.values())
+
+
+def allowed_tables_for(role: str | None) -> set[str]:
+    """Набор таблиц для роли.
+
+    role=None — объединение всех (CLI). Неизвестная роль не получает
+    ничего: неверный или подделанный role в токене должен приводить к
+    отказу, а не к полному доступу.
+    """
+    if role is None:
+        return ALLOWED_TABLES
+    return ALLOWED_TABLES_BY_ROLE.get(role, set())
+
+
 FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date", "email"}
+
+# Функции, которыми можно обойти ограничение личных данных или нагрузить
+# сервер. set_config и current_setting здесь критичны: через них
+# сгенерированный моделью запрос мог бы подменить app.student_id и
+# прочитать чужой профиль — то есть обойти всю схему личных вьюх.
+FORBIDDEN_FUNCTIONS = {
+    "set_config", "current_setting",
+    "pg_sleep", "pg_read_file", "pg_read_binary_file", "pg_ls_dir",
+    "lo_import", "lo_export", "dblink", "dblink_exec",
+    "query_to_xml", "pg_stat_file", "pg_terminate_backend",
+}
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
@@ -87,6 +142,12 @@ def _assert_select_only(sql: str) -> None:
             raise SQLSecurityError(
                 f"Обнаружена запрещённая конструкция: '{word.upper()}'."
             )
+
+    banned = set(tokens) & FORBIDDEN_FUNCTIONS
+    if banned:
+        raise SQLSecurityError(
+            f"Запрещённая функция: {', '.join(sorted(banned))}."
+        )
 
 
 # Токен: идентификатор (возможно составной через точку и/или в двойных
@@ -162,7 +223,9 @@ def _extract_table_refs(sql: str) -> list[str]:
     return refs
 
 
-def _assert_whitelist_tables(sql: str) -> None:
+def _assert_whitelist_tables(sql: str, allowed: set[str] | None = None) -> None:
+    if allowed is None:
+        allowed = ALLOWED_TABLES
     found = _extract_table_refs(sql)
     if not found:
         raise SQLSecurityError("Не удалось определить таблицу в запросе.")
@@ -177,10 +240,19 @@ def _assert_whitelist_tables(sql: str) -> None:
             raise SQLSecurityError(
                 f"Идентификаторы в двойных кавычках запрещены: {table}."
             )
-        if table.lower() not in ALLOWED_TABLES:
+        name = table.lower()
+        if name in allowed:
+            continue
+        # Отказ по роли и отказ по несуществующей таблице — разные вещи,
+        # и пользователю их надо объяснять по-разному: в первом случае
+        # данные есть, но не для него, во втором их нет вовсе.
+        if name in ALLOWED_TABLES:
             raise SQLSecurityError(
-                f"Таблица '{table}' не входит в список разрешённых."
+                f"Данные таблицы '{table}' недоступны вашей роли."
             )
+        raise SQLSecurityError(
+            f"Таблица '{table}' не входит в список разрешённых."
+        )
 
 
 def _assert_no_forbidden_columns(sql: str) -> None:
@@ -210,14 +282,20 @@ def _assert_single_statement(sql: str) -> None:
         )
 
 
-def validate_sql(sql: str) -> str:
+def validate_sql(sql: str, role: str | None = None) -> str:
+    """Проверяет запрос по политике безопасности для указанной роли.
+
+    role=None означает объединение всех ролей и используется только
+    CLI-режимом ai_agent.main(). Веб-путь обязан передавать роль из
+    проверенного токена.
+    """
     normalized = _normalize_sql(sql)
     if not normalized:
         raise SQLSecurityError("Пустой SQL-запрос.")
 
     _assert_select_only(normalized)
     _assert_single_statement(normalized)
-    _assert_whitelist_tables(normalized)
+    _assert_whitelist_tables(normalized, allowed_tables_for(role))
     _assert_no_forbidden_columns(normalized)
     return _ensure_limit(normalized)
 
@@ -237,7 +315,7 @@ def _format_value(value) -> str:
     return str(value)
 
 
-def execute_validated_sql(safe_sql: str) -> str:
+def execute_validated_sql(safe_sql: str, session_vars: dict | None = None) -> str:
     """Выполняет УЖЕ ПРОВЕРЕННЫЙ SELECT-запрос.
 
     Функция намеренно не вызывает validate_sql(): на вход подаётся ровно то,
@@ -249,7 +327,9 @@ def execute_validated_sql(safe_sql: str) -> str:
     начинающийся с «[Ошибка», — на это опирается main.py и фронтенд.
     """
     try:
-        rows = db.fetch_all("assistant", safe_sql)
+        rows = db.fetch_all(
+            "assistant", safe_sql, session_vars=session_vars, read_only=True
+        )
     except db.DBUnavailable as e:
         return f"[Ошибка БД] {e}"
     except psycopg.Error as e:
@@ -258,6 +338,65 @@ def execute_validated_sql(safe_sql: str) -> str:
         return f"[Ошибка БД] {str(e).strip()}"
 
     return "\n".join("|".join(_format_value(v) for v in row) for row in rows)
+
+
+async def aexecute_validated_sql(
+    safe_sql: str, session_vars: dict | None = None
+) -> str:
+    """Асинхронный вариант execute_validated_sql(). Контракт тот же."""
+    try:
+        rows = await db.afetch_all(
+            "assistant", safe_sql, session_vars=session_vars, read_only=True
+        )
+    except db.DBUnavailable as e:
+        return f"[Ошибка БД] {e}"
+    except psycopg.Error as e:
+        return f"[Ошибка БД] {str(e).strip()}"
+
+    return "\n".join("|".join(_format_value(v) for v in row) for row in rows)
+
+
+def _audit_statement_and_params(
+    username, role, question, generated_sql, executed_sql, verdict,
+    reject_reason, row_count, duration_ms, llm_ms, model,
+):
+    query = (
+        "INSERT INTO assistant.audit_log "
+        "(username, role, question, generated_sql, executed_sql, verdict, "
+        "reject_reason, row_count, duration_ms, llm_ms, model) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    params = (
+        username, role, question, generated_sql, executed_sql, verdict,
+        reject_reason, row_count, duration_ms, llm_ms, model,
+    )
+    return query, params
+
+
+async def alog_audit_entry(
+    username: str | None,
+    role: str | None,
+    question: str,
+    generated_sql: str | None,
+    executed_sql: str | None,
+    verdict: str,
+    reject_reason: str | None,
+    row_count: int | None,
+    duration_ms: int,
+    llm_ms: int,
+    model: str,
+) -> None:
+    """Асинхронный вариант log_audit_entry(). Контракт тот же."""
+    query, params = _audit_statement_and_params(
+        username, role, question, generated_sql, executed_sql, verdict,
+        reject_reason, row_count, duration_ms, llm_ms, model,
+    )
+    try:
+        await db.aexecute("assistant", query, params)
+    except db.DBUnavailable as e:
+        raise RuntimeError(f"БД недоступна: {e}") from e
+    except psycopg.Error as e:
+        raise RuntimeError(str(e).strip()) from e
 
 
 def log_audit_entry(
@@ -284,13 +423,7 @@ def log_audit_entry(
 
     Пароли сюда не попадают: логируются только вопрос, SQL и метаданные.
     """
-    query = (
-        "INSERT INTO assistant.audit_log "
-        "(username, role, question, generated_sql, executed_sql, verdict, "
-        "reject_reason, row_count, duration_ms, llm_ms, model) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-    )
-    params = (
+    query, params = _audit_statement_and_params(
         username, role, question, generated_sql, executed_sql, verdict,
         reject_reason, row_count, duration_ms, llm_ms, model,
     )

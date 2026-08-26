@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import json
@@ -6,6 +7,7 @@ import time
 import urllib.request
 import urllib.error
 
+import httpx
 import psycopg
 
 from . import db
@@ -90,7 +92,13 @@ def build_model_uri() -> str:
     return f"gpt://{FOLDER_ID}/{MODEL_NAME}"
 
 
-def get_db_schema() -> str:
+def get_db_schema(allowed: set[str] | None = None) -> str:
+    """Схема БД для промпта.
+
+    allowed — набор таблиц, доступных роли. Показывать модели то, чего ей
+    нельзя, вредно: она исправно построит запрос, проверка исправно его
+    отклонит, а пользователь увидит отказ вместо ответа.
+    """
     query = (
         "SELECT table_name, column_name, data_type "
         "FROM information_schema.columns "
@@ -98,18 +106,23 @@ def get_db_schema() -> str:
         "ORDER BY table_name, ordinal_position;"
     )
     try:
-        rows = db.fetch_all("assistant", query)
+        rows = db.fetch_all("assistant", query, read_only=True)
     except db.DBUnavailable as e:
         return f"[Не удалось получить схему БД] {e}"
     except psycopg.Error as e:
         return f"[Ошибка получения схемы БД] {str(e).strip()}"
 
+    if allowed is None:
+        allowed = security.ALLOWED_TABLES
+
     tables: dict[str, list[str]] = {}
     for table, column, dtype in rows:
+        if table not in allowed:
+            continue
         tables.setdefault(table, []).append(f"{column} ({dtype})")
 
     if not tables:
-        return "Схема БД пуста (нет таблиц в схеме assistant)."
+        return "Схема БД пуста (нет доступных таблиц в схеме assistant)."
 
     lines = ["Доступные таблицы и колонки в БД:"]
     for table in sorted(tables):
@@ -133,7 +146,7 @@ def get_db_relationships() -> str:
         "ORDER BY tc.table_name;"
     )
     try:
-        rows = db.fetch_all("assistant", query)
+        rows = db.fetch_all("assistant", query, read_only=True)
     except db.DBUnavailable as e:
         return f"[Не удалось получить связи БД] {e}"
     except psycopg.Error as e:
@@ -148,8 +161,14 @@ def get_db_relationships() -> str:
     return "Связи между таблицами (foreign keys):\n" + "\n".join(f"- {l}" for l in lines)
 
 
-def build_sql_system_prompt() -> str:
-    schema = get_db_schema()
+def build_sql_system_prompt(role: str | None = None) -> str:
+    """Системный промпт под конкретную роль.
+
+    Схема урезается до того, что роли действительно доступно, иначе модель
+    будет уверенно строить запросы к закрытым для неё таблицам.
+    """
+    allowed = security.allowed_tables_for(role)
+    schema = get_db_schema(allowed)
     relationships = get_db_relationships()
     if not relationships:
         relationships = MANUAL_RELATIONSHIPS_FALLBACK
@@ -160,6 +179,42 @@ def build_sql_system_prompt() -> str:
     # ответа. Схема тянется живьём, так что правило включится само, как
     # только применят backend/sql/002_ege_scores.sql — координировать
     # раскладку промпта и миграции руками не нужно.
+    # Личные вьюхи есть только у студента — и объяснить их надо явно,
+    # иначе модель начнёт искать «мои оценки» в закрытой таблице grades.
+    personal_rule = ""
+    if security.STUDENT_PERSONAL_TABLES & allowed:
+        personal_rule = (
+            "\n8. Личные данные самого пользователя доступны через "
+            "my_profile (ФИО, группа, курс, направление, статус, форма "
+            "оплаты), my_grades (оценки: subject_name, semester, score, "
+            "attempt, graded_at) и my_schedule (расписание его группы: "
+            "weekday, pair_number, week_type, subject_name, teacher_name, "
+            "building, room_number). Эти представления УЖЕ показывают "
+            "только данные текущего пользователя — не добавляй в них "
+            "фильтр по студенту, по имени или по идентификатору, его "
+            "подставляет сервер. На вопросы вида «мои оценки», «моё "
+            "расписание», «на каком я курсе» отвечай запросом к ним. "
+            "Пример: SELECT subject_name, score FROM my_grades "
+            "ORDER BY graded_at DESC."
+        )
+
+    teaching_rule = ""
+    if security.TEACHER_PERSONAL_TABLES & allowed:
+        teaching_rule = (
+            "\n9. Данные самого преподавателя доступны через my_teaching "
+            "(что он ведёт: subject_name, program_name, semester, "
+            "control_form, hours, students_count), my_teaching_schedule "
+            "(его собственное расписание: weekday, pair_number, week_type, "
+            "subject_name, group_name, course, building, room_number) и "
+            "my_students_performance (успеваемость по его предметам: "
+            "grades_count, avg_score, excellent_count, failed_count, "
+            "retake_count). Эти представления УЖЕ ограничены текущим "
+            "преподавателем — не добавляй фильтр по его имени или "
+            "идентификатору. На вопросы «что я веду», «моё расписание», "
+            "«как сдают мой предмет» отвечай запросом к ним, а не к "
+            "curriculum или grades_summary по всему вузу."
+        )
+
     ege_rule = ""
     if "ege_scores_summary" in schema:
         ege_rule = (
@@ -188,7 +243,6 @@ def build_sql_system_prompt() -> str:
         f"3. Если нужно много строк — добавь LIMIT (например, LIMIT 50).\n"
         f"4. В ответе выдай ЕДИНСТВЕННУЮ вещь — SQL в блоке ```sql ... ```. "
         f"Никакого пояснительного текста до и после. Никакого другого текста.\n"
-<<<<<<< HEAD
         f"5. Таблицы students, applications, grades и enrollments НАПРЯМУЮ "
         f"недоступны — они содержат персональные данные. Вместо них есть три "
         f"агрегированных представления, у каждого своя count-колонка:\n"
@@ -212,39 +266,22 @@ def build_sql_system_prompt() -> str:
         f"'первокурсников' используй course = 1, а НЕ enrolled_year = 1. "
         f"program_name фильтруй через ILIKE '%текст%' для нечувствительности "
         f"к регистру. Пример: SELECT SUM(student_count) FROM students_summary "
-=======
-        f"5. Таблицы students, applications, applicants, grades и enrollments "
-        f"НАПРЯМУЮ недоступны (содержат персональные данные). Вместо них используй "
-        f"агрегированные представления students_summary, applications_summary, "
-        f", grades_summary.\n"
-        f"   Например, students_summary сгруппирован по group_id/status/funding/"
-        f"enrolled_year и содержит колонку student_count (число студентов в каждой "
-        f"группе). Чтобы получить ОБЩЕЕ количество студентов, просуммируй эту колонку "
-        f"по всем группам: SELECT SUM(student_count) FROM students_summary. "
-        f"Чтобы получить количество по конкретному условию (например, status = "
-        f"'active'), добавь WHERE или GROUP BY по нужному полю и просуммируй "
-        f"student_count: SELECT SUM(student_count) FROM students_summary WHERE "
-        f"status = 'active'. Тот же приём (SUM соответствующей count-колонки) "
-        f"применяй к applications_summary (applications_count), "
-        f" (applicants_count) и grades_summary (grades_count)."
-        f"6. students_summary теперь содержит: faculty_id, program_name, degree, "
-        f"status, funding, enrolled_year, student_count. "
-        f"degree — это уровень образования ('бакалавриат', 'магистратура'), "
-        f"funding — форма оплаты ('бюджет', 'контракт'). НЕ путай их. "
-        f"program_name — название направления, фильтруй через ILIKE '%текст%' "
-        f"для нечувствительности к регистру. Пример: чтобы узнать сколько студентов "
-        f"учится на юриспруденции на бакалавриате: "
-        f"SELECT SUM(student_count) FROM students_summary "
->>>>>>> c750fddeb754b02bd021fbfca1a3898cdb6bcc6d
         f"WHERE program_name ILIKE '%юриспруденция%' AND degree = 'бакалавриат'."
         f"{ege_rule}"
+        f"{personal_rule}"
+        f"{teaching_rule}"
     )
 
 
 def extract_sql(text: str) -> str | None:
     text = text.strip()
 
-    fence = re.search(r"```(?:sql)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    # \s* до и после метки языка: модель периодически пишет «``` sql» с
+    # пробелом, и тогда прежний вариант отдавал «sql SELECT ...» — запрос
+    # падал на проверке «Разрешены только SELECT-запросы».
+    fence = re.search(
+        r"```\s*(?:sql\b)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL
+    )
     if fence:
         candidate = fence.group(1).strip()
         if candidate:
@@ -334,6 +371,102 @@ def _call_gpt_once(
         return None, f"[Неожиданный ответ] {data}", False
 
 
+def _request_body(system_text: str, user_text: str, temperature: float) -> dict:
+    return {
+        "modelUri": build_model_uri(),
+        "completionOptions": {
+            "stream": False,
+            "temperature": temperature,
+            "maxTokens": 2000,
+        },
+        "messages": [
+            {"role": "system", "text": system_text},
+            {"role": "user", "text": user_text},
+        ],
+    }
+
+
+def _request_headers() -> dict:
+    return {
+        "Authorization": f"Api-Key {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _parse_reply(data) -> tuple[str | None, str, bool]:
+    try:
+        return data["result"]["alternatives"][0]["message"]["text"], "", False
+    except (KeyError, IndexError, TypeError):
+        # Ответ пришёл, но формы не той — повтор не поможет.
+        return None, f"[Неожиданный ответ] {data}", False
+
+
+async def _acall_gpt_once(
+    system_text: str, user_text: str, temperature: float
+) -> tuple[str | None, str, bool]:
+    """Один асинхронный вызов API. Контракт как у _call_gpt_once()."""
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
+            resp = await client.post(
+                API_URL,
+                json=_request_body(system_text, user_text, temperature),
+                headers=_request_headers(),
+            )
+    except httpx.TimeoutException:
+        return None, f"[Ошибка сети] превышен таймаут {LLM_TIMEOUT_S} с", True
+    except httpx.HTTPError as e:
+        return None, f"[Ошибка сети] {e}", True
+    except UnicodeError as e:
+        # Не-ASCII в ключе или заголовках: ошибка конфигурации, не сбой сети.
+        return None, f"[Ошибка запроса] {e}", False
+
+    if resp.status_code >= 400:
+        return (
+            None,
+            f"[Ошибка API {resp.status_code}] {resp.text}",
+            resp.status_code in _RETRYABLE_HTTP_CODES,
+        )
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        return None, f"[Ошибка разбора ответа] {e}", True
+
+    return _parse_reply(data)
+
+
+async def acall_gpt(
+    system_text: str, user_text: str, temperature: float = LLM_TEMPERATURE
+) -> str:
+    """Асинхронный вызов Yandex GPT с повторами.
+
+    Веб-путь ходит сюда: обращение к модели занимает от секунды до
+    таймаута в 20 с, и раньше на это время вставал весь событийный цикл,
+    так что остальные пользователи ждали чужой запрос целиком.
+    """
+    last_error = "[Ошибка] вызов модели не выполнен"
+
+    for attempt in range(LLM_RETRIES + 1):
+        text, error, retryable = await _acall_gpt_once(
+            system_text, user_text, temperature
+        )
+        if text is not None:
+            return text
+
+        last_error = error
+        if not retryable or attempt == LLM_RETRIES:
+            break
+
+        print(
+            f"[acall_gpt] попытка {attempt + 1} из {LLM_RETRIES + 1} не удалась: "
+            f"{error[:150]} — повторяю",
+            file=sys.stderr,
+        )
+        await asyncio.sleep(LLM_RETRY_PAUSE_S * (attempt + 1))
+
+    return last_error
+
+
 def call_gpt(
     system_text: str, user_text: str, temperature: float = LLM_TEMPERATURE
 ) -> str:
@@ -364,12 +497,12 @@ def call_gpt(
     return last_error
 
 
-def run_sql_through_security(sql: str) -> str:
+def run_sql_through_security(sql: str, role: str | None = None) -> str:
     # CLI-путь (main()) отдаёт сюда непроверенный SQL, поэтому валидация
     # выполняется здесь, а в БД уходит уже проверенный текст:
     # execute_validated_sql() его повторно не валидирует.
     try:
-        safe_sql = security.validate_sql(sql)
+        safe_sql = security.validate_sql(sql, role)
     except security.SQLSecurityError as e:
         return f"[Запрос отклонён проверкой безопасности] {e}"
     return security.execute_validated_sql(safe_sql)

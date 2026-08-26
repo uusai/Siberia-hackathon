@@ -24,6 +24,7 @@ search_path=auth. Так изоляция схемы auth держится на 
 не только на проверках в security.py.
 """
 
+import asyncio
 import os
 import threading
 import time
@@ -58,10 +59,15 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 STATEMENT_TIMEOUT_MS = int(os.getenv("SQL_STATEMENT_TIMEOUT_MS", "5000"))
 
-# Кластер общий с другими командами (max_connections=100) — держим пул
-# маленьким и не занимаем чужие слоты.
-POOL_MIN = int(os.getenv("PG_POOL_MIN", "1"))
-POOL_MAX = int(os.getenv("PG_POOL_MAX", "4"))
+# Кластер общий с другими командами (max_connections=100), поэтому пул
+# небольшой. Но min_size=1 был ошибкой: пул наращивает соединения по
+# одному, и при одновременных запросах они выстраивались в очередь.
+# Замер: 4 параллельных запроса по секунде занимали 4.1 с при min_size=1
+# и 1.6 с при прогретом пуле. Плюс на этом сервере холодное соединение
+# стоит от 1.3 до 20 секунд, так что держать их тёплыми выгодно вдвойне.
+# Схем две (assistant и auth), то есть суммарно занимаем до 12 слотов.
+POOL_MIN = int(os.getenv("PG_POOL_MIN", "3"))
+POOL_MAX = int(os.getenv("PG_POOL_MAX", "6"))
 
 # Сколько ждать установки соединения и сколько — свободного слота в пуле.
 CONNECT_TIMEOUT_S = int(os.getenv("PG_CONNECT_TIMEOUT_S", "10"))
@@ -72,8 +78,17 @@ POOL_WAIT_S = float(os.getenv("PG_POOL_WAIT_S", "20"))
 RETRIES = int(os.getenv("PG_RETRIES", "2"))
 RETRY_PAUSE_S = float(os.getenv("PG_RETRY_PAUSE_S", "0.5"))
 
+# Синхронный пул: им пользуются операторские скрипты, CLI-режим
+# ai_agent.main() и тесты, где event loop'а нет. Веб-путь ходит сюда же,
+# но через asyncio.to_thread (см. afetch_all ниже): раньше эндпоинты были
+# объявлены async def, а внутри вызывали блокирующий драйвер, из-за чего
+# на время каждого запроса вставал весь событийный цикл и пользователи
+# ждали не своей очереди к БД, а вообще всего — включая /health.
 _pools: dict[str, ConnectionPool] = {}
 _pools_lock = threading.Lock()
+
+# Ошибки, при которых повтор осмыслен: обрыв соединения или нехватка слотов.
+_RETRYABLE = (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout)
 
 
 class DBUnavailable(Exception):
@@ -119,15 +134,31 @@ def get_pool(schema: str) -> ConnectionPool:
     return pool
 
 
-def _run(schema: str, sql: str, params, *, fetch: bool):
+def _run(schema: str, sql: str, params, *, fetch: bool, session_vars=None,
+         read_only: bool = False):
     last_error = None
     for attempt in range(RETRIES + 1):
         try:
             with get_pool(schema).connection() as conn:
                 with conn.cursor() as cur:
+                    if read_only:
+                        # ОБЯЗАТЕЛЬНО первым запросом транзакции: Postgres не
+                        # даёт вызвать SET TRANSACTION после того, как в ней
+                        # уже что-то выполнялось.
+                        cur.execute("SET TRANSACTION READ ONLY")
+                    # Сессионные переменные (например app.student_id) ставим
+                    # третьим аргументом true — это SET LOCAL, область
+                    # действия ограничена текущей транзакцией. Соединение
+                    # уходит обратно в пул чистым, так что чужой запрос
+                    # значение не подхватит. В read-only транзакции такие
+                    # вызовы разрешены: параметр сессии — не запись в данные.
+                    for name, value in (session_vars or {}).items():
+                        cur.execute(
+                            "SELECT set_config(%s, %s, true)", (name, str(value))
+                        )
                     cur.execute(sql, params)
                     return cur.fetchall() if fetch and cur.description else []
-        except (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout) as e:
+        except _RETRYABLE as e:
             # Обрыв соединения или нехватка слотов — имеет смысл повторить.
             last_error = e
             if attempt < RETRIES:
@@ -135,13 +166,26 @@ def _run(schema: str, sql: str, params, *, fetch: bool):
     raise DBUnavailable(str(last_error).strip() or "нет связи с БД")
 
 
-def fetch_all(schema: str, sql, params=None) -> list[tuple]:
+def fetch_all(schema: str, sql, params=None, session_vars=None,
+              read_only: bool = False) -> list[tuple]:
     """Выполняет SELECT и возвращает все строки. Бросает DBUnavailable.
 
     sql — строка либо psycopg.sql.Composable (когда запрос собирается из
     имён таблиц/колонок и их нужно безопасно заэкранировать).
+
+    session_vars — параметры сессии, выставляемые на время транзакции.
+    Через них личные вьюхи my_* узнают, чьи данные показывать: значение
+    приходит из проверенного токена, а не из SQL, который написала модель.
+
+    read_only — выполнить в транзакции только для чтения. Так ходит весь
+    путь чат-агента: у пользователя БД полные права на запись, и без
+    этого единственной преградой между сгенерированным моделью запросом
+    и DELETE оставался бы блеклист слов в security.py.
     """
-    return _run(schema, sql, params, fetch=True)
+    return _run(schema, sql, params, fetch=True, session_vars=session_vars,
+                read_only=read_only)
+
+
 
 
 def execute(schema: str, sql: str, params=None) -> None:
@@ -150,8 +194,44 @@ def execute(schema: str, sql: str, params=None) -> None:
 
 
 def close_all() -> None:
-    """Закрывает все пулы (для тестов и корректной остановки)."""
+    """Закрывает синхронные пулы (для тестов и скриптов)."""
     with _pools_lock:
         for pool in _pools.values():
             pool.close()
         _pools.clear()
+
+
+# ---------------------------------------------------------------------------
+# Асинхронный путь — им пользуется веб-приложение
+# ---------------------------------------------------------------------------
+#
+# Реализовано рабочим потоком поверх синхронного пула, а НЕ через
+# AsyncConnectionPool. Причина проверена на этой машине: psycopg в
+# асинхронном режиме отказывается работать на ProactorEventLoop, который
+# на Windows стоит по умолчанию, и требует SelectorEventLoop. Переключить
+# политику можно, но API для этого объявлен устаревшим в Python 3.14 и
+# удаляется в 3.16, плюс сработает только если успеть выставить её до
+# того, как uvicorn создаст цикл. Ставить демо на такую конструкцию не
+# стоит.
+#
+# Для нашей нагрузки разницы нет: запрос к БД занимает ~0.5 с, а пул всё
+# равно ограничен четырьмя соединениями, так что дальше четырёх потоков
+# работа не разойдётся. Событийный цикл при этом свободен полностью —
+# именно это и требовалось.
+
+async def afetch_all(schema: str, sql, params=None, session_vars=None,
+                     read_only: bool = False) -> list[tuple]:
+    """Асинхронный SELECT. Аргументы те же, что у fetch_all()."""
+    return await asyncio.to_thread(
+        fetch_all, schema, sql, params, session_vars, read_only
+    )
+
+
+async def aexecute(schema: str, sql, params=None) -> None:
+    """Асинхронный запрос без чтения результата."""
+    await asyncio.to_thread(execute, schema, sql, params)
+
+
+async def aclose_all() -> None:
+    """Закрывает пулы при остановке приложения."""
+    await asyncio.to_thread(close_all)

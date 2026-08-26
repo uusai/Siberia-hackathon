@@ -10,10 +10,10 @@ from . import ai_agent
 from . import db
 from . import security
 from .auth import (
+    aget_user_by_username,
+    averify_password,
     create_access_token,
     get_current_user,
-    get_user_by_username,
-    verify_password,
 )
 
 
@@ -22,7 +22,7 @@ async def lifespan(_app: FastAPI):
     yield
     # Закрываем пулы явно: иначе psycopg пытается дожать свои потоки уже на
     # финализации интерпретатора и падает с PythonFinalizationError.
-    db.close_all()
+    await db.aclose_all()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -39,7 +39,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-sql_system_prompt = ai_agent.build_sql_system_prompt()
+# Промпт свой на каждую роль: схема в нём урезана до того, что роли
+# действительно доступно. Иначе модель уверенно строит запрос к закрытой
+# таблице, проверка его отклоняет, и пользователь видит отказ вместо ответа.
+SQL_PROMPTS: dict[str, str] = {
+    role: ai_agent.build_sql_system_prompt(role)
+    for role in security.ALLOWED_TABLES_BY_ROLE
+}
 interpret_system_prompt = ai_agent.build_interpret_system_prompt()
 
 
@@ -63,9 +69,9 @@ class ChatResponse(BaseModel):
     sql: str | None = None
 
 
-def _safe_log_audit(**kwargs) -> None:
+async def _safe_log_audit(**kwargs) -> None:
     try:
-        security.log_audit_entry(**kwargs)
+        await security.alog_audit_entry(**kwargs)
     except Exception as e:
         print(f"[audit_log] Не удалось записать запись аудита: {e}", file=sys.stderr)
 
@@ -78,13 +84,20 @@ async def health():
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
-    user = get_user_by_username(request.username)
+    user = await aget_user_by_username(request.username)
     # Ответ одинаков и для несуществующего логина, и для неверного пароля,
     # чтобы перебором нельзя было выяснить, какие учётки существуют.
-    if user is None or not verify_password(request.password, user["password_hash"]):
+    if user is None or not await averify_password(
+        request.password, user["password_hash"]
+    ):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
-    token = create_access_token(username=user["username"], role=user["role"])
+    token = create_access_token(
+        username=user["username"],
+        role=user["role"],
+        student_id=user.get("student_id"),
+        teacher_id=user.get("teacher_id"),
+    )
     return LoginResponse(access_token=token, role=user["role"])
 
 
@@ -100,9 +113,24 @@ async def chat(
     role = current_user["role"]
     user_input = request.question.strip()
 
+    sql_system_prompt = SQL_PROMPTS.get(role)
+    if sql_system_prompt is None:
+        # Роль из токена не совпала ни с одной известной: отказ, а не
+        # доступ ко всему.
+        raise HTTPException(status_code=403, detail=f"Неизвестная роль: {role}")
+
+    # Личность для личных вьюх my_*. Берётся только из проверенного токена
+    # и уходит в сессионную переменную транзакции — сгенерированный моделью
+    # SQL на неё повлиять не может (set_config запрещён проверкой).
+    session_vars = {}
+    if current_user.get("student_id") is not None:
+        session_vars["app.student_id"] = current_user["student_id"]
+    if current_user.get("teacher_id") is not None:
+        session_vars["app.teacher_id"] = current_user["teacher_id"]
+
     if not user_input:
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        _safe_log_audit(
+        await _safe_log_audit(
             username=username,
             role=role,
             question=user_input,
@@ -118,13 +146,13 @@ async def chat(
         return ChatResponse(answer="Пустой вопрос.")
 
     llm_start = time.monotonic()
-    sql_reply = ai_agent.call_gpt(sql_system_prompt, user_input)
+    sql_reply = await ai_agent.acall_gpt(sql_system_prompt, user_input)
     llm_ms += int((time.monotonic() - llm_start) * 1000)
     sql = ai_agent.extract_sql(sql_reply)
 
     if not sql:
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        _safe_log_audit(
+        await _safe_log_audit(
             username=username,
             role=role,
             question=user_input,
@@ -142,10 +170,10 @@ async def chat(
     # Валидация выполняется РОВНО ОДИН РАЗ: дальше в БД уходит уже проверенный
     # текст, execute_validated_sql() его не перепроверяет.
     try:
-        executed_sql = security.validate_sql(sql)
+        executed_sql = security.validate_sql(sql, role)
     except security.SQLSecurityError as e:
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        _safe_log_audit(
+        await _safe_log_audit(
             username=username,
             role=role,
             question=user_input,
@@ -160,7 +188,9 @@ async def chat(
         )
         return ChatResponse(answer=f"[Запрос отклонён проверкой безопасности] {e}", sql=sql)
 
-    db_result = security.execute_validated_sql(executed_sql)
+    db_result = await security.aexecute_validated_sql(
+        executed_sql, session_vars=session_vars
+    )
 
     row_count = len(db_result.splitlines()) if db_result and not db_result.startswith("[Ошибка") else 0
 
@@ -170,11 +200,11 @@ async def chat(
         f"Результат из базы данных:\n{db_result}"
     )
     llm_start = time.monotonic()
-    human_answer = ai_agent.call_gpt(interpret_system_prompt, interpret_input)
+    human_answer = await ai_agent.acall_gpt(interpret_system_prompt, interpret_input)
     llm_ms += int((time.monotonic() - llm_start) * 1000)
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
-    _safe_log_audit(
+    await _safe_log_audit(
         username=username,
         role=role,
         question=user_input,
