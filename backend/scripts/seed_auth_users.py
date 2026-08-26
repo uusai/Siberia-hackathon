@@ -33,6 +33,9 @@ def hash_password(password: str) -> str:
 # ВНИМАНИЕ: демо-учётки, у которых пароль СОВПАДАЕТ С ЛОГИНОМ.
 # Годится только для хакатонского стенда.
 DEMO_USERS = [
+    # Абитуриент. Требует применённой миграции 015_applicant_role.sql —
+    # без неё CHECK на auth.users.role отвергнет эту строку.
+    ("applicant", "applicant"),
     ("student", "student"),
     ("teacher", "teacher"),
     ("deans-office", "deans-office"),

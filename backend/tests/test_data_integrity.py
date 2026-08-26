@@ -273,6 +273,39 @@ def test_every_pair_has_a_time():
 # Идемпотентность и неразрушительность
 # ---------------------------------------------------------------------
 
+def test_no_view_exposes_student_names():
+    """Ни одно доступное модели представление не выдаёт ФИО студента.
+
+    Регламент прав (user_right.md): данные студентов выводятся исключительно
+    в агрегированном или обезличенном виде. Гарантию даёт схема, а не роль:
+    миграция 014 убрала last_name/first_name/middle_name из student_rankings,
+    academic_debts и student_debts, оставив грануляцию строки прежней.
+
+    Проверка нужна именно здесь, а не в test_security_and_auth.py: там нет
+    базы, а _assert_no_forbidden_columns() про ФИО ничего не знает — эти
+    колонки в FORBIDDEN_COLUMNS не входят и входить не должны (иначе
+    сломается teachers.full_name, который выводить разрешено).
+
+    Исключение ровно одно: my_profile. Там человек видит собственное имя,
+    отфильтрованное по app.student_id, — своё, а не чужое.
+    """
+    from backend.app import security  # noqa: PLC0415
+
+    allowed_to_the_model = "', '".join(sorted(security.ALLOWED_TABLES))
+    rows = q(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = 'assistant' "
+        "  AND column_name IN ('last_name', 'first_name', 'middle_name') "
+        f"  AND table_name IN ('{allowed_to_the_model}') "
+        "ORDER BY table_name, column_name"
+    )
+    leaked = [(t, c) for t, c in rows if t != "my_profile"]
+    assert not leaked, (
+        "ФИО студентов выдаются модели через: "
+        + ", ".join(f"{t}.{c}" for t, c in leaked)
+    )
+
+
 def test_every_reference_table_has_a_natural_key():
     """Без уникального ключа повторный запуск сидера наплодил бы дубли."""
     tables = _existing_tables()

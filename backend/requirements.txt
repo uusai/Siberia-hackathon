@@ -12,8 +12,3 @@ pyjwt
 # несовместим с bcrypt >= 5.0 (его проба бэкенда шлёт пароль длиннее 72 байт
 # и падает с ValueError).
 bcrypt
-# Разбор PDF с приложениями к Правилам приёма ИГУ. Приложению не нужен —
-# нужен сборщику датасета (backend/scripts/build_dataset.py), который иногда
-# запускают внутри контейнера: docker compose exec backend python
-# scripts/build_dataset.py. Без него команда падает на импорте.
-pypdf

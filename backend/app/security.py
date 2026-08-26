@@ -66,12 +66,11 @@ _BASE_TABLES = {
     "admission_campaigns",
 }
 
-# Официальный справочник ИГУ (миграции 006/008) и надстройка расписания с
-# датами (007). Всё это — публично опубликованные сведения: структура вуза,
-# перечни вступительных испытаний, минимальные баллы, сроки приёма, стоимость
-# обучения, адреса и телефоны приёмной комиссии. Ограничивать их по ролям
-# незачем: абитуриент, который спрашивает «что сдавать на юриспруденцию»,
-# заходит под той же учёткой, что и студент.
+# Официальный справочник вуза (миграции 006/008): структура, перечни
+# вступительных испытаний, минимальные баллы, сроки приёма, стоимость
+# обучения, адреса и телефоны приёмной комиссии. Всё это опубликованные
+# сведения, и ограничивать их по ролям незачем — это единственный набор,
+# который целиком достаётся абитуриенту.
 #
 # ПРО КОЛОНКИ КОНТАКТОВ. В contacts, dormitories и university_units телефон и
 # почта называются contact_phone и contact_email, а не phone и email. Это не
@@ -81,7 +80,7 @@ _BASE_TABLES = {
 # отклонялся бы проверкой. Токены contact_phone и contact_email в чёрный
 # список не входят, а сам список не ослабляется: он по-прежнему закрывает
 # паспорт, телефон, почту и дату рождения студентов и абитуриентов.
-_OFFICIAL_REFERENCE_TABLES = {
+_ADMISSION_REFERENCE = {
     # справочник и его источники
     "data_sources", "university_units", "edu_programs",
     # приёмная кампания
@@ -94,9 +93,17 @@ _OFFICIAL_REFERENCE_TABLES = {
     # модель вместо самостоятельной сборки JOIN'ов
     "programs_admission", "program_exam_sets", "minimum_scores_view",
     "passing_scores_view", "data_status_summary",
-    # расписание с датами и временем
+}
+
+# Расписание с датами и временем (миграция 007). Вынесено из справочника
+# отдельно ровно из-за абитуриента: ему расписание занятий не нужно и не
+# положено — он ещё не учится. Всем, кто внутри учебного процесса, набор
+# достаётся вместе со справочником.
+_SCHEDULE_REFERENCE = {
     "pair_times", "academic_terms", "lesson_occurrences", "schedule_calendar",
 }
+
+_OFFICIAL_REFERENCE_TABLES = _ADMISSION_REFERENCE | _SCHEDULE_REFERENCE
 
 # Качество расписания — рабочий инструмент деканата, а не ответ студенту.
 # Студенту незачем знать, что в его расписании нашлось пересечение: ему нужно
@@ -119,21 +126,39 @@ _ANALYTICS_PUBLIC = {
 # доступно преподавателю, которому надо понимать, как идёт его предмет.
 _ANALYTICS_TEACHING = {"subject_performance"}
 
-# ПОИМЁННАЯ успеваемость и нагрузка. Только деканат и администрация.
+# Успеваемость и нагрузка в разрезе подразделений. Деканат и администрация.
 #
-# student_rankings и academic_debts показывают ФИО студентов — это осознанное
-# расширение прав деканата, который по должности работает с успеваемостью
-# поимённо. Паспорта, телефона, почты и даты рождения в них нет: эти поля
-# остались в FORBIDDEN_COLUMNS и в самих представлениях отсутствуют.
-# Студенту и преподавателю эти объекты не выдаются.
+# ФИО СТУДЕНТОВ ЗДЕСЬ НЕТ НИ У КОГО. Раньше student_rankings и academic_debts
+# показывали фамилии, и это было осознанным расширением прав деканата. Прав
+# на это регламент (user_right.md) не даёт: данные студентов выводятся только
+# в агрегированном или обезличенном виде, статистика отчислений — без ФИО.
+# Миграция 014 убрала три колонки с именами из самих представлений, оставив
+# грануляцию строки прежней. Поэтому «сколько студентов с задолженностью» и
+# «средний балл по факультету» отвечаются как раньше, а «назови их фамилии» —
+# не отвечается ничем: имён нет в схеме.
+#
+# Набор всё равно ограничен ролью: это внутренние сведения об учебном
+# процессе, студенту и преподавателю они не адресованы.
 _ANALYTICS_DEANS = {
-    "student_rankings", "academic_debts", "department_performance",
-    "department_workload", "teacher_semester_load", "funding_share",
+    "student_rankings", "academic_debts", "student_debts", "department_debts",
+    "department_performance", "department_workload", "teacher_semester_load",
+    "funding_share",
 }
 
-# Приёмная кампания в разрезе дней и годов. Обезличено, но это внутренняя
-# статистика вуза, поэтому только администрации — как и applications_summary.
-_ANALYTICS_ADMIN = {"applications_by_day", "admission_dynamics"}
+# Приёмная кампания в разрезе дней. Обезличено, но это внутренняя кухня
+# приёмной комиссии — кто и в какой день подал, — поэтому только
+# администрации, как и applications_summary.
+#
+# admission_dynamics сюда НЕ входит: динамика набора по годам в разрезе
+# направления — ровно то, что регламент отдаёт абитуриенту («статистика
+# прошлых лет в агрегированном виде»). Она в _ADMISSION_STATS ниже.
+_ANALYTICS_ADMIN = {"applications_by_day"}
+
+# Агрегированная статистика приёма прошлых лет: сколько подано и сколько
+# зачислено по направлению и году. Ни ФИО, ни контактов, ни идентификаторов —
+# только счётчики и средние. Доступна всем, кто спрашивает про поступление,
+# начиная с абитуриента.
+_ADMISSION_STATS = {"admission_dynamics"}
 
 # Личные вьюхи студента. Они сами фильтруются по app.student_id, который
 # бэкенд выставляет из проверенного токена (см. sql/003_role_access.sql):
@@ -148,22 +173,40 @@ TEACHER_PERSONAL_TABLES = {
     "my_teaching", "my_teaching_schedule", "my_students_performance",
 }
 
-# Доступ накопительный: каждая следующая роль видит всё, что предыдущая.
-# Официальный справочник доступен всем — это опубликованные сведения.
+# Раскладка по ролям из регламента (user_right.md).
+#
+# Внутри учебного контура доступ накопительный: преподаватель видит всё, что
+# студент, деканат — всё, что преподаватель, и так далее.
+#
+# АБИТУРИЕНТ — САМАЯ УЗКАЯ РОЛЬ, строгое подмножество студенческой. Ему
+# оставлено ровно то, по чему выбирают, куда подавать документы: справочник
+# приёма, соотношение мест и обезличенная статистика набора прошлых лет.
+# Всего учебного контура он не видит — ни расписания занятий, ни учебных
+# планов групп, ни загруженности аудиторий, ни личных представлений my_*.
+# Причина не в секретности, а в том, что этих данных о нём просто нет: он ещё
+# не учится, и строки в assistant.students для него не существует. Раньше
+# отдельной роли не было и абитуриент заходил под учёткой студента, получая
+# заодно чужое расписание.
+# Статистика приёма (_ADMISSION_STATS) достаётся ВСЕМ ролям, а не только
+# верхним. Иначе вышла бы дыра наоборот: абитуриент видит динамику набора, а
+# декан — нет. Данные обезличенные и публичные по смыслу, скрывать их от тех,
+# кто выше по цепочке, нечем и незачем.
 ALLOWED_TABLES_BY_ROLE: dict[str, set[str]] = {
+    "applicant": _ADMISSION_REFERENCE | _ADMISSION_STATS | {"seats_ratio"},
     "student": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
-    | STUDENT_PERSONAL_TABLES,
+    | _ADMISSION_STATS | STUDENT_PERSONAL_TABLES,
     "teacher": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
-    | _ANALYTICS_TEACHING | TEACHER_PERSONAL_TABLES | {
+    | _ADMISSION_STATS | _ANALYTICS_TEACHING | TEACHER_PERSONAL_TABLES | {
         "curriculum", "grades_summary",
     },
     "deans-office": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
-    | _ANALYTICS_TEACHING | _ANALYTICS_DEANS | _SCHEDULE_QUALITY_TABLES | {
+    | _ADMISSION_STATS | _ANALYTICS_TEACHING | _ANALYTICS_DEANS
+    | _SCHEDULE_QUALITY_TABLES | {
         "curriculum", "grades_summary", "students_summary",
     },
     "administration": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
-    | _ANALYTICS_TEACHING | _ANALYTICS_DEANS | _ANALYTICS_ADMIN
-    | _SCHEDULE_QUALITY_TABLES | {
+    | _ADMISSION_STATS | _ANALYTICS_TEACHING | _ANALYTICS_DEANS
+    | _ANALYTICS_ADMIN | _SCHEDULE_QUALITY_TABLES | {
         "curriculum", "grades_summary", "students_summary",
         "applications_summary", "ege_scores_summary",
     },

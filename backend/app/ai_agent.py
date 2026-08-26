@@ -203,16 +203,56 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         personal_rule = (
             "\n8. Личные данные самого пользователя доступны через "
             "my_profile (ФИО, группа, курс, направление, статус, форма "
-            "оплаты), my_grades (оценки: subject_name, semester, score, "
+            "оплаты, а также его собственная почта в системе — колонка "
+            "называется student_email, НЕ email), my_grades (оценки: "
+            "subject_name, semester, score, "
             "attempt, graded_at) и my_schedule (расписание его группы: "
             "weekday, pair_number, week_type, subject_name, teacher_name, "
             "building, room_number). Эти представления УЖЕ показывают "
             "только данные текущего пользователя — не добавляй в них "
             "фильтр по студенту, по имени или по идентификатору, его "
             "подставляет сервер. На вопросы вида «мои оценки», «моё "
-            "расписание», «на каком я курсе» отвечай запросом к ним. "
+            "расписание», «на каком я курсе», «какая у меня почта в "
+            "системе» отвечай запросом к ним. "
             "Пример: SELECT subject_name, score FROM my_grades "
-            "ORDER BY graded_at DESC."
+            "ORDER BY graded_at DESC. Пример: SELECT last_name, "
+            "student_email FROM my_profile."
+        )
+
+    # Абитуриент. Правило нужно не ради разрешений — их и так решает whitelist,
+    # а схема в промпте уже урезана до доступного, — а ради ФОРМУЛИРОВКИ
+    # ОТКАЗА. Без него на «какое у меня расписание» модель строит запрос к
+    # schedule_calendar, проверка его отклоняет, и человек видит вместо ответа
+    # сообщение об ошибке безопасности. Пусть лучше сразу знает, что учебных
+    # данных у него нет, потому что он ещё не студент.
+    applicant_rule = ""
+    if role == "applicant":
+        applicant_rule = (
+            "\n15. КТО СПРАШИВАЕТ. Это АБИТУРИЕНТ — он ещё не поступил и не "
+            "учится. Ему доступны только сведения о приёме: направления и "
+            "специальности, вступительные испытания, минимальные и проходные "
+            "баллы, количество мест, стоимость обучения, сроки, документы, "
+            "льготы, общежития, контакты приёмной комиссии и обезличенная "
+            "статистика набора прошлых лет.\n"
+            "   Расписания занятий, учебных планов, оценок, преподавателей и "
+            "аудиторий у него НЕТ — и не потому, что закрыто, а потому что "
+            "таких данных о нём не существует. Личных представлений my_* "
+            "тоже нет: за этой учётной записью не стоит студент. Если вопрос "
+            "про «мои оценки», «моё расписание» или «моя группа» — SQL не "
+            "строй вообще, а объясни, что эти сведения появятся после "
+            "зачисления."
+        )
+
+    # Подсказка про обозначение группы — часть правила 9, но названные в ней
+    # таблицы есть не у всех: абитуриенту расписание и учебные планы не
+    # выдаются. Называть модели объект, которого нет в её схеме, значит
+    # подталкивать её к запросу, который отклонит проверка.
+    group_lookup_rule = ""
+    if {"schedule_calendar", "group_curriculum"} & allowed:
+        group_lookup_rule = (
+            "   - «ФИТ-0925-1» и подобное — это ГРУППА: ищи по колонке "
+            "group_name в schedule_calendar или group_curriculum. В таблице "
+            "groups колонка называется просто name, а не group_name.\n"
         )
 
     teaching_rule = ""
@@ -274,6 +314,15 @@ def build_sql_system_prompt(role: str | None = None) -> str:
             "   - льготы, целевое, квоты -> benefits_quotas; общежития -> "
             "dormitories; адреса и телефоны -> contacts (колонки "
             "contact_phone, contact_email).\n"
+            "   - СТАТИСТИКА ПРИЁМА ПРОШЛЫХ ЛЕТ («сколько заявлений подали на "
+            "это направление», «сколько зачислили», «как менялся набор») -> "
+            "admission_dynamics (campaign_year, program_name, degree, "
+            "faculty_name, funding_type, applications_count, enrolled_count, "
+            "avg_ege_total, budget_seats, paid_seats). Она обезличена: "
+            "счётчики и средние, без единого имени. Пример: SELECT "
+            "campaign_year, sum(applications_count), sum(enrolled_count) FROM "
+            "admission_dynamics WHERE program_name ILIKE '%экономика%' GROUP "
+            "BY campaign_year ORDER BY campaign_year.\n"
             "   - СТРУКТУРА УНИВЕРСИТЕТА — только university_units. «Сколько "
             "факультетов», «какие институты есть», «что за подразделения» — "
             "считай и перечисляй по ней: SELECT count(*) FROM "
@@ -354,12 +403,25 @@ def build_sql_system_prompt(role: str | None = None) -> str:
             "сдавших с первой попытки -> subject_performance (колонки "
             "excellent_count, good_count, satisfactory_count, failed_count, "
             "first_attempt_pass_rate, retake_count, avg_score);\n"
-            "   - рейтинг студентов, средний балл конкретного человека -> "
-            "student_rankings (last_name, first_name, group_name, "
-            "faculty_name, semester, avg_score);\n"
-            "   - задолженности и пересдачи -> academic_debts (debts_count, "
+            "   - средний балл по факультету, направлению, группе или "
+            "семестру -> student_rankings. ФИО там НЕТ и быть не может: "
+            "строка — один обезличенный студент за один семестр (group_name, "
+            "course, program_name, degree, faculty_name, semester, status, "
+            "funding, grades_count, avg_score, excellent_count, "
+            "failed_count). Считай по ней агрегаты: SELECT faculty_name, "
+            "round(avg(avg_score), 2) FROM student_rankings WHERE semester = 2 "
+            "GROUP BY faculty_name. На просьбу назвать фамилии отвечать "
+            "нечем — таких данных в базе нет ни у одной роли, и придумывать "
+            "их нельзя;\n"
+            "   - сколько должников на кафедре и какая это доля -> "
+            "department_debts (department_name, faculty_name, students_total, "
+            "debtors_count, debts_total, retakes_total, debtors_percent). Это "
+            "ГОТОВАЯ сводка, для вопроса «сколько должников на кафедре X» бери "
+            "её, а не считай вручную;\n"
+            "   - задолженности подробнее, по студентам обезличенно -> "
+            "academic_debts (debts_count, "
             "retakes_count, passed_count, department_name, group_name, "
-            "faculty_name, program_name — колонки semester здесь НЕТ). "
+            "faculty_name, program_name — колонок semester и ФИО здесь НЕТ). "
             "КАФЕДРУ ищи ТОЛЬКО через search_vector: WHERE search_vector @@ "
             "plainto_tsquery('russian', 'программная инженерия'). ILIKE по "
             "department_name не сработает — в базе кафедра записана как "
@@ -398,7 +460,8 @@ def build_sql_system_prompt(role: str | None = None) -> str:
             "campaign_year = 2025 AND days_before_deadline BETWEEN 0 AND 7. "
             "У applications_summary дат нет вовсе — для вопросов про дни она "
             "не годится;\n"
-            "   - динамика приёма по годам -> admission_dynamics.\n"
+            "   - динамика приёма по годам -> admission_dynamics, она уже "
+            "описана в правиле про поступление выше.\n"
             "   ПОИСК ПО НАЗВАНИЯМ В АНАЛИТИКЕ. У этих представлений тоже "
             "есть search_vector с русской морфологией — он собран из названий "
             "кафедры, факультета, направления, группы и дисциплины. Ищи "
@@ -500,11 +563,10 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         f"SELECT program_name, level, study_form, unit_name, exams_required, "
         f"budget_seats, tuition_rub FROM programs_admission WHERE "
         f"search_vector @@ plainto_tsquery('russian', 'психология');\n"
-        f"   - «ФИТ-0925-1» и подобное — это ГРУППА: ищи по колонке "
-        f"group_name в schedule_calendar или group_curriculum. В таблице "
-        f"groups колонка называется просто name, а не group_name.\n"
+        f"{group_lookup_rule}"
         f"   Не отказывайся и не переспрашивай — покажи, что нашлось."
         f"{ege_rule}"
+        f"{applicant_rule}"
         f"{personal_rule}"
         f"{teaching_rule}"
         f"{admission_rule}"

@@ -36,13 +36,30 @@ ALTER TABLE auth.users ADD CONSTRAINT users_person_link_ck CHECK (
 -- ---------------------------------------------------------------------
 -- Паспорт, телефон и дата рождения не выставляются нигде: они и в
 -- security.FORBIDDEN_COLUMNS, и по существу не нужны для ответов.
+--
+-- ПРО ИМЯ КОЛОНКИ ПОЧТЫ. Здесь student_email, а не email — по той же
+-- причине, по которой в миграции 006 контакты названы contact_phone и
+-- contact_email: security._assert_no_forbidden_columns() ищет слова из
+-- FORBIDDEN_COLUMNS во ВСЁМ тексте запроса, разбивая его на токены
+-- [a-zA-Z_]+, без всякой привязки к таблице. Пока колонка называлась
+-- email, запрос вида «SELECT last_name, email FROM my_profile» отклонялся
+-- проверкой — хотя my_profile это собственная строка вошедшего студента,
+-- уже отфильтрованная по app.student_id, и никакой утечки в ней нет.
+-- Ловилось это только на явном перечислении колонок: SELECT * слова email
+-- в тексте не содержит, поэтому старый тест на my_profile проблему не видел.
+-- Сам чёрный список НЕ ослабляется: students.email по-прежнему закрыт.
+--
+-- DROP + CREATE, а не CREATE OR REPLACE: PostgreSQL не даёт переименовать
+-- колонку существующего представления через REPLACE («cannot change name of
+-- view column»). Тот же приём уже применён в 013_admission_days.sql.
+DROP VIEW IF EXISTS assistant.my_profile;
 
-CREATE OR REPLACE VIEW assistant.my_profile AS
+CREATE VIEW assistant.my_profile AS
 SELECT
     s.last_name,
     s.first_name,
     s.middle_name,
-    s.email,
+    s.email AS student_email,
     g.name  AS group_name,
     g.course,
     p.name  AS program_name,

@@ -60,18 +60,22 @@ def _query(sql: str):
 # а не сырые таблицы. Четвёртый элемент отмечает вопросы, где пустой
 # результат — правильный ответ, а не отсутствие данных.
 ANSWERABLE = [
-    ("Топ-5 студентов факультета IT со средним баллом", "deans-office",
-     "SELECT last_name, first_name, group_name, avg_score FROM student_rankings "
-     "WHERE faculty_name ILIKE '%информацион%' ORDER BY avg_score DESC LIMIT 5"),
+    # ФИО студентов не выводятся ни одной роли (миграция 014), поэтому
+    # вопросы про успеваемость сформулированы так, как их задаёт регламент:
+    # «сколько», «какой средний», «какая доля» — а не «назови поимённо».
+    ("Средний балл по факультету информационных технологий", "deans-office",
+     "SELECT faculty_name, round(avg(avg_score), 2) AS gpa, count(*) AS students "
+     "FROM student_rankings WHERE faculty_name ILIKE '%информацион%' "
+     "GROUP BY faculty_name"),
 
-    ("У какого студента группы больше всего задолженностей", "deans-office",
-     "SELECT last_name, first_name, sum(debts_count) AS debts FROM academic_debts "
-     "WHERE group_name = 'ФИТ-0925-1' GROUP BY last_name, first_name "
-     "ORDER BY debts DESC LIMIT 3"),
+    ("Сколько студентов группы имеют задолженности", "deans-office",
+     "SELECT group_name, count(*) FILTER (WHERE debts_count > 0) AS debtors, "
+     "sum(debts_count) AS debts FROM academic_debts "
+     "WHERE group_name = 'ФИТ-0925-1' GROUP BY group_name"),
 
     ("Сколько должников на кафедре программной инженерии", "deans-office",
-     "SELECT count(*) FROM academic_debts "
-     "WHERE department_name ILIKE '%программной инженерии%' AND debts_count > 0"),
+     "SELECT department_name, students_total, debtors_count, debtors_percent "
+     "FROM department_debts WHERE department_name ILIKE '%программной инженерии%'"),
 
     ("Процент сдавших «Базы данных» с первой попытки", "teacher",
      "SELECT subject_name, sum(first_attempt_passed), sum(first_attempt_total), "
@@ -120,15 +124,14 @@ ANSWERABLE = [
      "WHERE avg_hours_per_teacher > 250 ORDER BY avg_hours_per_teacher DESC"),
 
     # Пустой ответ здесь — законный: «таких студентов нет» это тоже ответ.
-    ("Кто не сдал ни одного экзамена", "deans-office",
-     "SELECT last_name, first_name, group_name FROM student_rankings "
-     "GROUP BY last_name, first_name, group_name HAVING max(avg_score) < 3 LIMIT 10",
+    ("Сколько студентов не сдали ни одного экзамена", "deans-office",
+     "SELECT count(*) FROM student_debts WHERE passed_count = 0",
      True),
 
-    ("Студенты с несданными экзаменами", "deans-office",
-     "SELECT last_name, first_name, group_name, sum(debts_count) AS debts "
-     "FROM academic_debts GROUP BY last_name, first_name, group_name "
-     "HAVING sum(debts_count) > 5 ORDER BY debts DESC LIMIT 10"),
+    ("По каким факультетам больше всего студентов с долгами", "deans-office",
+     "SELECT faculty_name, count(*) FILTER (WHERE debts_count > 5) AS heavy, "
+     "count(*) FILTER (WHERE debts_count > 0) AS debtors "
+     "FROM student_debts GROUP BY faculty_name ORDER BY heavy DESC LIMIT 10"),
 
     ("Список преподавателей и их нагрузка", "student",
      "SELECT full_name, position, hours_per_year FROM teachers "
@@ -150,6 +153,23 @@ ANSWERABLE = [
      "SELECT campaign_year, sum(applications_count) FROM applications_by_day "
      "WHERE status = 'зачислен' AND funding_type = 'бюджет' "
      "AND submitted_at = docs_to GROUP BY campaign_year ORDER BY campaign_year DESC"),
+
+    # --- абитуриент: своя роль, свой набор данных ---
+    ("Какие направления есть и сколько на них мест", "applicant",
+     "SELECT program_name, unit_name, budget_seats, paid_seats, tuition_rub "
+     "FROM programs_admission WHERE admission_year = 2026 "
+     "ORDER BY budget_seats DESC NULLS LAST LIMIT 10"),
+
+    ("Статистика подачи заявлений за прошлые годы", "applicant",
+     "SELECT campaign_year, sum(applications_count) AS submitted, "
+     "sum(enrolled_count) AS enrolled FROM admission_dynamics "
+     "GROUP BY campaign_year ORDER BY campaign_year DESC LIMIT 5"),
+
+    ("Проходной балл на юриспруденцию в прошлом году", "applicant",
+     "SELECT program_name, admission_year, study_form, funding_basis, "
+     "competition_group, passing_score FROM passing_scores_view "
+     "WHERE program_name ILIKE '%юриспруденция%' "
+     "ORDER BY admission_year DESC LIMIT 5"),
 
     # --- официальные сведения ИГУ ---
     ("Какие институты и факультеты есть в ИГУ", "student",
@@ -228,6 +248,14 @@ MUST_REJECT = [
      "SELECT * FROM faculties WHERE 1=1; SELECT * FROM students"),
     ("Средний балл конкретного студента (студентом)", "student",
      "SELECT last_name, avg_score FROM student_rankings"),
+    # Абитуриент вне учебного контура: расписания и оценок у него нет вовсе.
+    ("Моё расписание (абитуриентом)", "applicant",
+     "SELECT weekday, pair_number, subject_name FROM my_schedule"),
+    ("Расписание группы (абитуриентом)", "applicant",
+     "SELECT lesson_date, subject_name FROM schedule_calendar "
+     "WHERE group_name = 'ФИТ-0925-1'"),
+    ("Успеваемость студентов (абитуриентом)", "applicant",
+     "SELECT faculty_name, avg_score FROM student_rankings"),
 ]
 
 

@@ -86,6 +86,18 @@ def _rejects_for(sql: str, role: str) -> bool:
     return False
 
 
+# Роли учебного контура — все, кроме абитуриента.
+#
+# Абитуриент намеренно выпадает из накопительной цепочки: он не «студент с
+# урезанными правами», а человек вне учебного процесса. Расписания, учебных
+# планов, аудиторий и преподавателей у него нет вовсе, поэтому проверки вида
+# «это доступно каждому» перебирают именно ACADEMIC_ROLES. Список считается
+# из самой раскладки, чтобы новая роль не забылась молча.
+ACADEMIC_ROLES = [
+    r for r in security.ALLOWED_TABLES_BY_ROLE if r != "applicant"
+]
+
+
 def test_roles_gate_aggregated_views():
     # Контингент — не для студента и не для преподавателя.
     assert _rejects_for("SELECT SUM(student_count) FROM students_summary", "student")
@@ -108,7 +120,7 @@ def test_roles_gate_aggregated_views():
 
 
 def test_base_tables_available_to_everyone():
-    for role in security.ALLOWED_TABLES_BY_ROLE:
+    for role in ACADEMIC_ROLES:
         assert not _rejects_for("SELECT * FROM teachers", role)
         assert not _rejects_for(
             "SELECT weekday, pair_number FROM schedule", role)
@@ -139,7 +151,7 @@ def test_personal_views_only_for_student():
                 "SELECT * FROM my_grades",
                 "SELECT * FROM my_schedule"):
         assert not _rejects_for(sql, "student")
-        for role in ("teacher", "deans-office", "administration"):
+        for role in ("applicant", "teacher", "deans-office", "administration"):
             assert _rejects_for(sql, role), f"{role} не должен видеть {sql}"
 
 
@@ -153,9 +165,9 @@ def test_teacher_views_only_for_teacher():
 
 
 def test_official_reference_available_to_everyone():
-    # Официальный справочник ИГУ (миграции 006/008) — публичные сведения:
-    # структура вуза, вступительные испытания, сроки, стоимость. Ограничивать
-    # их по ролям незачем, абитуриент заходит под той же учёткой.
+    # Справочник приёма — публичные сведения: структура вуза, вступительные
+    # испытания, сроки, стоимость. Это единственный набор, который целиком
+    # достаётся ВСЕМ ролям, включая абитуриента.
     for role in security.ALLOWED_TABLES_BY_ROLE:
         for sql in (
             "SELECT official_name FROM university_units",
@@ -166,9 +178,13 @@ def test_official_reference_available_to_everyone():
             "SELECT doc_name FROM admission_documents",
             "SELECT name, provided_to FROM dormitories",
             "SELECT question, answer FROM faq_entries",
-            "SELECT lesson_date, subject_name FROM schedule_calendar",
         ):
             assert not _rejects_for(sql, role), f"{role} должен видеть: {sql}"
+
+    # Расписание с датами — уже учебный контур, абитуриенту оно не положено.
+    for role in ACADEMIC_ROLES:
+        assert not _rejects_for(
+            "SELECT lesson_date, subject_name FROM schedule_calendar", role)
 
 
 def test_public_contacts_survive_the_personal_data_filter():
@@ -180,6 +196,17 @@ def test_public_contacts_survive_the_personal_data_filter():
     )
     assert not _rejects_for(
         "SELECT name, contact_phone FROM dormitories", "student"
+    )
+
+
+def test_own_email_survives_the_personal_data_filter():
+    # Тот же класс бага, что был у contacts/dormitories: student_email —
+    # легитимная колонка my_profile (данные самого пользователя о самом
+    # себе), но текстово содержит подстроку, похожую на forbidden-слово
+    # только если её не переименовать. Явный список колонок должен
+    # проходить, а не просто SELECT *.
+    assert not _rejects_for(
+        "SELECT last_name, student_email FROM my_profile", "student"
     )
 
 
@@ -204,16 +231,68 @@ def test_schedule_quality_views_are_for_the_deans_office():
         assert not _rejects_for(sql, "administration")
 
 
-def test_named_student_data_is_limited_to_the_deans_office():
-    # student_rankings и academic_debts показывают ФИО студентов. Это
-    # осознанное расширение прав деканата, а не дыра — и оно не должно
-    # расползтись на студента и преподавателя.
-    for sql in ("SELECT last_name, avg_score FROM student_rankings",
-                "SELECT last_name, debts_count FROM academic_debts"):
-        assert _rejects_for(sql, "student")
-        assert _rejects_for(sql, "teacher")
+def test_performance_analytics_is_limited_to_the_deans_office():
+    # Успеваемость и задолженности в разрезе подразделений — внутренние
+    # сведения об учебном процессе. Обезличены (ФИО из этих представлений
+    # убрала миграция 014), но студенту и преподавателю всё равно не
+    # адресованы: преподавателю хватает своих предметов.
+    for sql in ("SELECT faculty_name, avg(avg_score) FROM student_rankings "
+                "GROUP BY faculty_name",
+                "SELECT department_name, debts_count FROM academic_debts",
+                "SELECT department_name, debtors_percent FROM department_debts",
+                "SELECT group_name, debts_count FROM student_debts"):
+        for role in ("applicant", "student", "teacher"):
+            assert _rejects_for(sql, role), f"{role} не должен видеть: {sql}"
         assert not _rejects_for(sql, "deans-office")
         assert not _rejects_for(sql, "administration")
+
+
+def test_no_role_can_reach_a_students_name():
+    # Регламент (user_right.md): данные студентов выводятся исключительно в
+    # агрегированном или обезличенном виде. Гарантию даёт СХЕМА, а не эта
+    # проверка: колонок с ФИО в аналитических представлениях больше нет
+    # (миграция 014), поэтому запрос отклонит уже сама БД.
+    #
+    # Здесь проверяется вторая половина: сырые таблицы с ФИО по-прежнему
+    # закрыты whitelist'ом всем без исключения. Соответствие представлений
+    # схеме проверяет test_data_integrity.test_no_view_exposes_student_names.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        for sql in ("SELECT last_name, first_name FROM students",
+                    "SELECT s.last_name FROM students s JOIN groups g "
+                    "ON g.id = s.group_id",
+                    "SELECT applicant_name FROM applications"):
+            assert _rejects_for(sql, role), f"{role} не должен видеть: {sql}"
+
+
+def test_applicant_sees_admission_data_and_nothing_else():
+    # Абитуриент — самая узкая роль. Ему нужно выбрать, куда подавать
+    # документы, и ровно это ему и доступно.
+    for sql in (
+        "SELECT program_name, budget_seats, paid_seats FROM programs_admission",
+        "SELECT program_name, passing_score FROM passing_scores_view",
+        "SELECT stage, date_to FROM admission_deadlines",
+        "SELECT doc_name FROM admission_documents",
+        "SELECT campaign_year, applications_count FROM admission_dynamics",
+        "SELECT program_name, budget_percent FROM seats_ratio",
+        "SELECT title, contact_phone FROM contacts",
+    ):
+        assert not _rejects_for(sql, "applicant"), f"абитуриент должен видеть: {sql}"
+
+    # Учебного контура у него нет вовсе: он ещё не учится, и данных о нём в
+    # assistant.students не существует.
+    for sql in (
+        "SELECT * FROM my_profile",
+        "SELECT * FROM my_grades",
+        "SELECT * FROM my_schedule",
+        "SELECT lesson_date FROM schedule_calendar",
+        "SELECT weekday FROM schedule",
+        "SELECT * FROM group_curriculum",
+        "SELECT * FROM room_availability",
+        "SELECT full_name FROM teachers",
+        "SELECT * FROM subject_performance",
+        "SELECT * FROM students_summary",
+    ):
+        assert _rejects_for(sql, "applicant"), f"абитуриенту не положено: {sql}"
 
 
 def test_anonymous_analytics_is_open_wider():
@@ -221,8 +300,10 @@ def test_anonymous_analytics_is_open_wider():
     assert _rejects_for("SELECT * FROM subject_performance", "student")
     assert not _rejects_for("SELECT * FROM subject_performance", "teacher")
 
-    # Аудитории и учебные планы не содержат ничего личного — доступны всем.
-    for role in security.ALLOWED_TABLES_BY_ROLE:
+    # Аудитории и учебные планы не содержат ничего личного — доступны всем,
+    # кто внутри учебного процесса. Абитуриенту они не нужны: он выбирает
+    # направление, а не ищет свободную аудиторию.
+    for role in ACADEMIC_ROLES:
         assert not _rejects_for(
             "SELECT building, room_number FROM room_availability "
             "WHERE is_free AND weekday = 1 AND pair_number = 2", role)
@@ -231,11 +312,27 @@ def test_anonymous_analytics_is_open_wider():
 
 
 def test_admission_statistics_stay_with_administration():
-    for sql in ("SELECT * FROM applications_by_day",
-                "SELECT * FROM admission_dynamics"):
-        for role in ("student", "teacher", "deans-office"):
-            assert _rejects_for(sql, role)
-        assert not _rejects_for(sql, "administration")
+    # Разбивка по дням подачи — внутренняя кухня приёмной комиссии: кто и в
+    # какой день принёс документы. Остаётся за администрацией.
+    sql = "SELECT * FROM applications_by_day"
+    for role in ("applicant", "student", "teacher", "deans-office"):
+        assert _rejects_for(sql, role)
+    assert not _rejects_for(sql, "administration")
+
+
+def test_admission_dynamics_is_open_to_the_applicant():
+    # А вот динамика набора по годам — то, по чему абитуриент выбирает, куда
+    # подавать документы: сколько подали и сколько зачислили на направление в
+    # прошлые годы. Регламент отдаёт эту статистику именно ему. Данные
+    # обезличены: счётчики и средние, ни ФИО, ни контактов.
+    #
+    # Доступна всем ролям, а не только абитуриенту: иначе вышла бы дыра
+    # наоборот — абитуриент видит динамику набора, а декан нет.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        assert not _rejects_for(
+            "SELECT campaign_year, sum(applications_count) "
+            "FROM admission_dynamics GROUP BY campaign_year", role
+        ), f"{role} должен видеть динамику набора"
 
 
 def test_applicant_contacts_are_unreachable_for_everyone():
