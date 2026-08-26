@@ -68,8 +68,11 @@ const dom = {
   authScreen:  $('authScreen'),
   authForm:    $('authForm'),
   authError:   $('authError'),
+  authSubmit:  $('authSubmit'),
   login:       $('login'),
   password:    $('password'),
+  revealBtn:   $('revealBtn'),
+  demoRoles:   $('demoRoles'),
 
   chatScreen:  $('chatScreen'),
   thread:      $('thread'),
@@ -81,10 +84,14 @@ const dom = {
   input:       $('messageInput'),
   sendBtn:     $('sendBtn'),
 
+  themeBtn:    $('themeBtn'),
+  themeText:   $('themeText'),
+
   session:     $('session'),
   sessionUser: $('sessionUser'),
   sessionRole: $('sessionRole'),
   logoutBtn:   $('logoutBtn'),
+  clearBtn:    $('clearBtn'),
   status:      $('status'),
   statusText:  $('statusText')
 };
@@ -131,6 +138,37 @@ function plural(n, one, few, many) {
   return many;
 }
 
+/* ═══ 4a. ТЕМА ════════════════════════════════════════════════════════
+ *
+ * Само переключение — это одна строка (data-theme на <html>), вся палитра
+ * пересчитывается токенами в style.css. Здесь только выбор и его хранение.
+ *
+ * Начальное значение ставит встроенный скрипт в <head>, ДО отрисовки:
+ * иначе при выбранной светлой теме страница успевает мигнуть тёмной.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+const THEME_KEY = 'assistant:theme';
+const THEME_LABEL = { dark: 'тёмная', light: 'светлая' };
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  dom.themeText.textContent = THEME_LABEL[theme];
+  dom.themeBtn.setAttribute('aria-pressed', String(theme === 'light'));
+  // Подсказка браузеру: от неё зависит цвет системных элементов формы
+  // и полос прокрутки.
+  document.querySelector('meta[name="color-scheme"]')
+    ?.setAttribute('content', theme === 'light' ? 'light dark' : 'dark light');
+  try { localStorage.setItem(THEME_KEY, theme); } catch { /* приватный режим */ }
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme() === 'light' ? 'dark' : 'light');
+}
+
 /* ═══ 5. АВТОРИЗАЦИЯ ══════════════════════════════════════════════════
    Настоящая авторизация против бэкенда: POST /auth/login отдаёт JWT,
    он живёт в state.token и уходит заголовком Authorization на /chat.
@@ -161,6 +199,61 @@ function saveSession(user, token, role) {
   } catch {
     /* приватный режим — работаем без сохранения */
   }
+}
+
+/* ═══ 5b. ИСТОРИЯ ДИАЛОГА ═════════════════════════════════════════════
+ *
+ * Лента жила только в DOM: обновление страницы стирало разговор целиком.
+ * На демонстрации это заметно — показали ответ, задели F5, показывать нечего.
+ *
+ * Храним под ключом пользователя: на общем стенде под одной ролью заходят по
+ * очереди, и чужая переписка в своей ленте выглядит как сбой.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+const THREAD_PREFIX = 'assistant:thread:';
+const THREAD_MAX    = 30;
+
+let history = [];
+
+const threadKey = (user) => THREAD_PREFIX + user;
+
+function loadHistory(user) {
+  try {
+    const raw = localStorage.getItem(threadKey(user));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory() {
+  if (!state.user) return;
+  // Таблица в 200 строк весит немало, а квота localStorage — около 5 МБ.
+  // При переполнении выбрасываем половину самых старых реплик и пробуем
+  // ещё раз: потерять начало разговора лучше, чем не сохранить ничего.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      localStorage.setItem(threadKey(state.user), JSON.stringify(history));
+      return;
+    } catch {
+      history = history.slice(Math.ceil(history.length / 2));
+    }
+  }
+}
+
+function clearHistory() {
+  history = [];
+  try { localStorage.removeItem(threadKey(state.user)); } catch { /* не критично */ }
+}
+
+/** Восстанавливает ленту после перезагрузки страницы. */
+function restoreThread() {
+  history = loadHistory(state.user).slice(-THREAD_MAX);
+  if (!history.length) return;
+  history.forEach((entry) => addMessage(entry.who, entry.payload, {
+    at: entry.at, restore: true
+  }));
 }
 
 /**
@@ -220,6 +313,11 @@ function showAuth() {
 
   dom.authForm.reset();
   dom.authError.hidden = true;
+  // reset() не трогает type поля, поэтому показанный пароль остался бы
+  // видимым на экране входа следующего человека.
+  dom.password.type = 'password';
+  dom.revealBtn.textContent = 'показать';
+  dom.revealBtn.setAttribute('aria-pressed', 'false');
   dom.login.focus();
 }
 
@@ -323,6 +421,13 @@ function showChat(user, token, role) {
   dom.session.hidden = false;
   dom.sessionUser.textContent = user;
 
+  // Лента прошлой сессии этого пользователя. Делается ДО фокуса и опроса
+  // связи: восстановление дописывает узлы и прокручивает ленту вниз.
+  dom.thread.replaceChildren(dom.intro);
+  dom.intro.hidden = false;
+  restoreThread();
+  dom.clearBtn.hidden = history.length === 0;
+
   const roleTitle = ROLE_TITLE[state.role] || state.role;
   dom.sessionRole.textContent = roleTitle || '';
   dom.sessionRole.hidden = !roleTitle;
@@ -340,9 +445,22 @@ function showChat(user, token, role) {
 
 function logout() {
   try { localStorage.removeItem(SESSION_KEY); } catch { /* не критично */ }
+  // Саму переписку не стираем: она под ключом пользователя и вернётся при
+  // следующем входе. Для «убрать с экрана» есть кнопка «Очистить».
+  history = [];
   dom.thread.replaceChildren(dom.intro);
   dom.intro.hidden = false;
+  dom.clearBtn.hidden = true;
   showAuth();
+}
+
+/** Убирает переписку с экрана и из хранилища, оставляя вход. */
+function clearThread() {
+  clearHistory();
+  dom.thread.replaceChildren(dom.intro);
+  dom.intro.hidden = false;
+  dom.clearBtn.hidden = true;
+  dom.input.focus();
 }
 
 /* ═══ 6. НОРМАЛИЗАЦИЯ ОТВЕТА ══════════════════════════════════════════ */
@@ -357,10 +475,32 @@ function normalizeReply(payload) {
   ).trim();
 
   const sql = payload?.sql ? String(payload.sql).trim() : null;
-  const table = buildTableFromData(payload?.data, payload?.columns);
+  const verdict = payload?.verdict ? String(payload.verdict) : null;
+  const tookMs = Number.isFinite(payload?.took_ms) ? payload.took_ms : null;
+  // rows — то, что отдаёт /chat теперь: строки прямо из БД. data — имя из
+  // изначальной спеки, оставлено для совместимости. Раньше ни того, ни
+  // другого не приходило, и таблицу приходилось выпарсивать из прозы модели —
+  // то есть почти никогда.
+  const table = buildTableFromData(payload?.rows ?? payload?.data, payload?.columns);
 
-  return { text, sql, table };
+  return { text, sql, table, verdict, tookMs };
 }
+
+/* Исходы, при которых ассистент НЕ ответил на вопрос. Разделены на два вида,
+ * и это не косметика: «эти данные не положены вашей роли» — работающее
+ * правило, а «база не ответила» — поломка. Показывать их одинаково значит
+ * выдавать штатную работу системы за сбой. */
+const REFUSAL_VERDICTS = new Set(['rejected', 'out_of_scope', 'empty', 'no_sql']);
+const FAILURE_VERDICTS = new Set(['db_error', 'placeholder']);
+
+const VERDICT_LABEL = {
+  rejected:     'отказано по правилу',
+  out_of_scope: 'вне области ассистента',
+  empty:        'данных не нашлось',
+  no_sql:       'вопрос не распознан',
+  db_error:     'ошибка базы данных',
+  placeholder:  'ответ не сформулирован'
+};
 
 /** Собирает таблицу из data/columns. data — массив объектов или массив массивов. */
 function buildTableFromData(data, columns) {
@@ -788,24 +928,54 @@ function renderCopyAction(text) {
   return button;
 }
 
-/** Реплика в ленте: микро-лейбл говорящего и содержимое под ним. */
-function addMessage(who, payload) {
+/**
+ * Реплика в ленте: микро-лейбл говорящего и содержимое под ним.
+ *
+ * options.at      — момент реплики (нужен при восстановлении истории,
+ *                   иначе у всех сообщений было бы время загрузки страницы);
+ * options.restore — реплика пришла из истории, записывать её обратно не надо.
+ */
+function addMessage(who, payload, options = {}) {
   if (dom.intro && !dom.intro.hidden) dom.intro.hidden = true;
 
-  const kind = who === 'user' ? 'user' : (who === 'error' ? 'error' : 'bot');
+  const KINDS = { user: 1, error: 1, refusal: 1, bot: 1 };
+  const kind = KINDS[who] ? who : 'bot';
   const article = el('article', `msg msg--${kind}`);
 
-  const label = kind === 'user' ? (state.user || 'вы') : (kind === 'error' ? 'ошибка' : 'ассистент');
+  const AUTHOR = {
+    user: state.user || 'вы',
+    error: 'сбой',
+    refusal: 'ассистент',
+    bot: 'ассистент'
+  };
   const head = el('p', 'msg__who');
-  head.appendChild(el('span', 'msg__author', label));
+  head.appendChild(el('span', 'msg__author', AUTHOR[kind]));
+
+  // Почему ассистент не ответил — словом, рядом с автором реплики.
+  const note = payload && typeof payload === 'object'
+    ? VERDICT_LABEL[payload.verdict] : null;
+  if (note) head.appendChild(el('span', 'msg__verdict', note));
   // Время реплики. В длинной ленте без него непонятно, какой ответ свежий,
   // а на защите — сколько заняли те самые два обращения к модели.
-  const time = new Date();
+  const time = options.at ? new Date(options.at) : new Date();
   const stamp = el('time', 'msg__time',
     time.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
   stamp.dateTime = time.toISOString();
   head.appendChild(stamp);
+
+  // Длительность всего пути: вопрос -> модель -> SQL -> проверка -> база.
+  // На защите это спрашивают первым делом, а искать по логам некогда.
+  const took = payload && typeof payload === 'object' ? payload.tookMs : null;
+  if (Number.isFinite(took)) {
+    head.appendChild(el('span', 'msg__took', `${(took / 1000).toFixed(1)} с`));
+  }
   article.appendChild(head);
+
+  if (!options.restore) {
+    history.push({ who, payload, at: time.toISOString() });
+    if (history.length > THREAD_MAX) history = history.slice(-THREAD_MAX);
+    saveHistory();
+  }
 
   if (typeof payload === 'string') {
     article.appendChild(renderProse(payload));
@@ -850,6 +1020,8 @@ function addMessage(who, payload) {
   }
 
   dom.thread.appendChild(article);
+  // В ленте появилось что убирать.
+  if (dom.clearBtn) dom.clearBtn.hidden = false;
   requestAnimationFrame(() => article.scrollIntoView({ behavior: 'smooth', block: 'end' }));
 }
 
@@ -900,19 +1072,31 @@ async function send(question) {
     const payload = await res.json();
     const reply = normalizeReply(payload);
 
-    // Структурированных полей нет — вытаскиваем SQL и таблицу из текста
+    // Запасной путь: если структурированных полей в ответе не оказалось,
+    // достаём SQL и таблицу из текста. Текст урезаем ТОЛЬКО когда из него
+    // действительно что-то взяли — иначе ответ терял бы куски зря.
     if (!reply.sql || !reply.table) {
       const fromText = parseFromText(reply.text);
-      reply.sql = reply.sql || fromText.sql;
-      reply.table = reply.table || fromText.table;
-      if (fromText.sql || fromText.table) reply.text = fromText.text;
+      const tookSql   = !reply.sql   && Boolean(fromText.sql);
+      const tookTable = !reply.table && Boolean(fromText.table);
+      if (tookSql)   reply.sql = fromText.sql;
+      if (tookTable) reply.table = fromText.table;
+      if (tookSql || tookTable) reply.text = fromText.text;
     }
 
     setStatus('online');
 
-    // «[Ошибка БД] …» и «[Запрос отклонён…]» — штатно обработанные случаи
-    const rejected = /^\s*\[(ошибка|запрос отклонён|неожиданный ответ)/i.test(reply.text);
-    addMessage(rejected ? 'error' : 'bot', reply);
+    // Вид реплики определяет ИСХОД с бэкенда, а не догадка по тексту.
+    // Прежняя проверка искала «[Запрос отклонён…]» регулярным выражением —
+    // но explain_rejection() отдаёт человеческую фразу без скобок, поэтому
+    // условие не срабатывало ни разу и отказы рисовались как обычные ответы.
+    let kind = 'bot';
+    if (REFUSAL_VERDICTS.has(reply.verdict)) kind = 'refusal';
+    else if (FAILURE_VERDICTS.has(reply.verdict)) kind = 'error';
+    // Ответ без исхода (старый бэкенд) — как раньше, по тексту.
+    else if (!reply.verdict && /^\s*\[(ошибка|запрос отклонён)/i.test(reply.text)) kind = 'error';
+
+    addMessage(kind, reply);
 
   } catch (err) {
     setStatus('offline');
@@ -976,9 +1160,14 @@ function bindEvents() {
   dom.authForm.addEventListener('submit', async (e) => {
     e.preventDefault();
 
-    // signIn теперь ходит по сети — блокируем кнопку на время запроса
-    const submitBtn = dom.authForm.querySelector('button[type="submit"]');
-    if (submitBtn) submitBtn.disabled = true;
+    // signIn ходит по сети, а проверка пароля намеренно медленная (bcrypt).
+    // Отключённой кнопки мало — без текста непонятно, идёт ли что-то вообще.
+    const submitBtn = dom.authSubmit;
+    const label = submitBtn ? submitBtn.textContent : '';
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Входим…';
+    }
     dom.authError.hidden = true;
 
     try {
@@ -992,7 +1181,10 @@ function bindEvents() {
       saveSession(result.user, result.token, result.role);
       showChat(result.user, result.token, result.role);
     } finally {
-      if (submitBtn) submitBtn.disabled = false;
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = label;
+      }
     }
   });
 
@@ -1000,7 +1192,29 @@ function bindEvents() {
     field.addEventListener('input', () => { dom.authError.hidden = true; });
   });
 
+  // Демо-учётки: подставляем пару в форму, но не входим сами — под какой
+  // ролью заходишь, должно быть видно до нажатия «Войти».
+  dom.demoRoles.addEventListener('click', (event) => {
+    const button = event.target.closest('.demo-role');
+    if (!button) return;
+    const login = button.dataset.login;
+    dom.login.value = login;
+    dom.password.value = login;   // на стенде пароль совпадает с логином
+    dom.authError.hidden = true;
+    dom.authSubmit.focus();
+  });
+
+  dom.revealBtn.addEventListener('click', () => {
+    const shown = dom.password.type === 'text';
+    dom.password.type = shown ? 'password' : 'text';
+    dom.revealBtn.textContent = shown ? 'показать' : 'скрыть';
+    dom.revealBtn.setAttribute('aria-pressed', String(!shown));
+    dom.password.focus();
+  });
+
+  dom.themeBtn.addEventListener('click', toggleTheme);
   dom.logoutBtn.addEventListener('click', logout);
+  dom.clearBtn.addEventListener('click', clearThread);
 
   dom.composer.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -1021,6 +1235,9 @@ function bindEvents() {
 
 function init() {
   bindEvents();
+  // Тему уже применил скрипт в <head>; здесь только приводим подпись кнопки
+  // в соответствие с тем, что стоит на самом деле.
+  applyTheme(currentTheme());
   setBusy(false);
 
   const session = loadSession();

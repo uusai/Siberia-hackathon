@@ -108,7 +108,7 @@ def test_roles_gate_aggregated_views():
 
 
 def test_base_tables_available_to_everyone():
-    for role in security.ALLOWED_TABLES_BY_ROLE:
+    for role in security.STAFF_ROLES:
         assert not _rejects_for("SELECT * FROM teachers", role)
         assert not _rejects_for(
             "SELECT weekday, pair_number FROM schedule", role)
@@ -156,7 +156,7 @@ def test_official_reference_available_to_everyone():
     # Официальный справочник ИГУ (миграции 006/008) — публичные сведения:
     # структура вуза, вступительные испытания, сроки, стоимость. Ограничивать
     # их по ролям незачем, абитуриент заходит под той же учёткой.
-    for role in security.ALLOWED_TABLES_BY_ROLE:
+    for role in security.STAFF_ROLES:
         for sql in (
             "SELECT official_name FROM university_units",
             "SELECT program_name, budget_seats FROM programs_admission",
@@ -222,7 +222,7 @@ def test_anonymous_analytics_is_open_wider():
     assert not _rejects_for("SELECT * FROM subject_performance", "teacher")
 
     # Аудитории и учебные планы не содержат ничего личного — доступны всем.
-    for role in security.ALLOWED_TABLES_BY_ROLE:
+    for role in security.STAFF_ROLES:
         assert not _rejects_for(
             "SELECT building, room_number FROM room_availability "
             "WHERE is_free AND weekday = 1 AND pair_number = 2", role)
@@ -427,6 +427,272 @@ def test_set_config_is_blocked():
     assert _rejects_for(
         "SELECT current_setting('app.student_id') FROM my_profile", "student")
     assert _rejects_for("SELECT pg_sleep(10) FROM university_units", "student")
+
+
+def test_cte_names_are_accepted_inside_their_own_query():
+    # Раньше WITH не работал вообще: имя CTE в whitelist не входит и не войдёт,
+    # поэтому FROM x отклонялся как «таблица не в списке разрешённых». А модель
+    # пишет через WITH ровно те вопросы, ради которых заведена аналитика:
+    # «кафедры со средним баллом ниже общего», «доля платников по направлениям».
+    assert not _rejects_for(
+        "WITH avg_by_dept AS ("
+        "  SELECT department_name, avg_score FROM department_performance"
+        ") SELECT department_name FROM avg_by_dept WHERE avg_score < 4",
+        "deans-office",
+    )
+    # Несколько CTE через запятую и RECURSIVE.
+    assert not _rejects_for(
+        "WITH a AS (SELECT 1 AS n FROM university_units), "
+        "b AS (SELECT n FROM a) SELECT n FROM b", "student"
+    )
+    assert not _rejects_for(
+        "WITH RECURSIVE t AS (SELECT 1 AS n FROM university_units) "
+        "SELECT n FROM t", "student"
+    )
+
+
+def test_cte_does_not_smuggle_a_closed_table():
+    # Имя CTE разрешает ссылаться на само выражение, а не на что угодно внутри
+    # него: тело проверяется на общих основаниях.
+    assert _rejects_for(
+        "WITH x AS (SELECT * FROM students) SELECT * FROM x", "administration")
+    assert _rejects_for(
+        "WITH x AS (SELECT * FROM auth.users) SELECT * FROM x", "administration")
+    # И CTE не действует за пределами своего запроса.
+    assert _rejects_for("SELECT * FROM avg_by_dept", "deans-office")
+
+
+def test_outer_limit_survives_a_nested_one():
+    # «Выведи вообще все оценки за всю историю»: подзапрос со своим LIMIT
+    # раньше засчитывался за внешний, и выборка уходила неограниченной.
+    bounded = security.validate_sql(
+        "SELECT * FROM (SELECT * FROM subject_performance LIMIT 5) t", "teacher")
+    assert bounded.rstrip().upper().endswith(f"LIMIT {security.DEFAULT_LIMIT}"), bounded
+    # Настоящий внешний LIMIT по-прежнему уважается и режется по потолку.
+    assert "LIMIT 10" in security.validate_sql(
+        "SELECT * FROM subject_performance LIMIT 10", "teacher")
+    capped = security.validate_sql(
+        "SELECT * FROM (SELECT * FROM subject_performance LIMIT 5) t LIMIT 99999",
+        "teacher")
+    assert f"LIMIT {security.MAX_LIMIT}" in capped
+    # Внутренний LIMIT при этом не тронут.
+    assert "LIMIT 5" in capped
+
+
+def test_words_inside_string_literals_are_data_not_code():
+    # Промпт сам предписывает искать по faq_entries ключевыми словами, а
+    # блеклист читал содержимое кавычек как код и отклонял запрос.
+    assert not _rejects_for(
+        "SELECT question, answer FROM faq_entries "
+        "WHERE question ILIKE '%email%'", "student")
+    assert not _rejects_for(
+        "SELECT name FROM subjects WHERE name ILIKE '%create%'", "student")
+    assert not _rejects_for(
+        "SELECT name FROM subjects WHERE name ILIKE '%drop%'", "student")
+    # Точка с запятой внутри литерала ничего не разделяет.
+    assert not _rejects_for(
+        "SELECT name FROM subjects WHERE name LIKE '%a;b%'", "student")
+    # При этом настоящие конструкции вне кавычек закрыты по-прежнему.
+    assert _rejects_for("SELECT * FROM subjects; DROP TABLE students", "student")
+    assert _rejects_for("SELECT email FROM my_profile", "student")
+
+
+def test_groups_catalog_answers_the_question_that_used_to_be_invented():
+    # Объект, которого не было: «какие группы учатся на направлении X».
+    # Без него модель соединяла groups с edu_programs и получала пустоту.
+    for role in security.STAFF_ROLES:
+        assert not _rejects_for(
+            "SELECT group_name, course FROM groups_catalog "
+            "WHERE search_vector @@ plainto_tsquery('russian', "
+            "'информационная безопасность')", role)
+
+
+def test_guest_sees_only_the_public_admission_reference():
+    # Гость — посетитель сайта вуза через встраиваемый виджет. Токен ему
+    # выдаётся БЕЗ ПАРОЛЯ любому желающему (POST /auth/guest), поэтому набор
+    # обязан быть самым узким из всех: только то, что и так опубликовано.
+    for sql in (
+        "SELECT program_name, budget_seats, tuition_rub FROM programs_admission",
+        "SELECT required_subjects FROM program_exam_sets",
+        "SELECT stage, date_to FROM admission_deadlines",
+        "SELECT doc_name FROM admission_documents",
+        "SELECT question, answer FROM faq_entries",
+        "SELECT official_name, kind FROM university_units",
+        "SELECT title, contact_phone FROM contacts",
+        # Расписание вузы публикуют открыто, и это самый частый вопрос на
+        # сайте. Гостю оно доступно через public_schedule — без ФИО.
+        "SELECT lesson_date, subject_name, room_number FROM public_schedule",
+        "SELECT pair_number, starts_at FROM pair_times",
+        "SELECT term_name, date_from FROM academic_terms",
+        "SELECT building, number, capacity FROM rooms",
+    ):
+        assert not _rejects_for(sql, "guest"), f"гостю нужен доступ: {sql}"
+
+    # Всё, что про людей и учебный процесс, закрыто.
+    for sql in (
+        "SELECT * FROM students_summary",
+        "SELECT * FROM grades_summary",
+        "SELECT * FROM academic_debts",
+        "SELECT * FROM student_debts",
+        "SELECT * FROM student_rankings",
+        "SELECT * FROM subject_performance",
+        "SELECT * FROM teachers",
+        "SELECT * FROM my_profile",
+        "SELECT * FROM ege_scores_summary",
+        "SELECT * FROM applications_summary",
+        "SELECT * FROM auth.users",
+        # Расписание С ФИО преподавателей гостю закрыто: одно дело —
+        # опубликованное расписание занятий, другое — возможность у анонимного
+        # посетителя спросить, где конкретный преподаватель в четверг в 14:00.
+        "SELECT * FROM schedule_calendar",
+        "SELECT * FROM lesson_occurrences",
+    ):
+        assert _rejects_for(sql, "guest"), f"гость не должен видеть: {sql}"
+
+    # Гость шире студента ровно на один объект — public_schedule, и это
+    # намеренно. Сотрудникам безымянная копия не нужна: у них есть
+    # schedule_calendar со всеми полями, а два объекта на одни и те же данные
+    # плодят двусмысленность, из-за которой модель уже отвечала «по одним
+    # данным 88%, по другим 86,8%».
+    assert (security.allowed_tables_for("guest") - {"public_schedule"}
+            <= security.allowed_tables_for("student"))
+    assert "public_schedule" not in security.allowed_tables_for("student")
+
+
+def test_guest_refusals_are_worded_for_a_website_visitor():
+    # Посетителю сайта нечего делать с фразой «доступ выдаёт администратор
+    # системы»: он не сотрудник и прав не просил.
+    def explain(sql, role):
+        try:
+            security.validate_sql(sql, role)
+        except security.SQLSecurityError as e:
+            return security.explain_rejection(e, role)
+        raise AssertionError(f"должно было отклониться: {sql}")
+
+    guest_text = explain("SELECT * FROM student_debts", "guest")
+    assert "поступлени" in guest_text
+    assert "администратор" not in guest_text
+
+    # Для сотрудников формулировка прежняя.
+    assert "администратор" in explain("SELECT * FROM student_debts", "student")
+
+
+def test_spoken_refusal_is_told_apart_from_a_broken_query():
+    # Модель регулярно отказывает СЛОВАМИ, заворачивая фразу в SELECT без
+    # FROM. Формально это запрос без таблицы, и проверка отклоняет его с
+    # «Не удалось определить таблицу» — текстом, который пользователю ничего
+    # не объясняет: он спрашивал не про таблицы.
+    for sql in (
+        "SELECT 'Сведения о преподавателях не предоставляются.'",
+        "SELECT 'В базе данных нет информации о контактах абитуриентов.'",
+        "SELECT 'Доступ к такой информации не предоставлен' AS message",
+        "select 'нет данных'   ",
+    ):
+        assert security.looks_like_a_spoken_refusal(sql), sql
+
+    # Настоящие запросы за отказ не принимаются.
+    for sql in (
+        "SELECT program_name FROM programs_admission",
+        "SELECT 'бюджет' AS kind, count(*) FROM enrollment_places",
+        "SELECT count(*) FROM university_units",
+        "SELECT 1",
+    ):
+        assert not security.looks_like_a_spoken_refusal(sql), sql
+
+
+def test_guest_throttle_is_separate_from_login():
+    from backend.app import throttle
+
+    throttle.clear()
+    try:
+        assert throttle.guest_retry_after("10.0.0.1") == 0
+        for _ in range(throttle.GUEST_MAX):
+            throttle.note_guest_request("10.0.0.1")
+        assert throttle.guest_retry_after("10.0.0.1") > 0
+        # Другой адрес не задет, и вход по паролю тоже.
+        assert throttle.guest_retry_after("10.0.0.2") == 0
+        assert throttle.retry_after("10.0.0.1") == 0
+    finally:
+        throttle.clear()
+
+
+def test_login_throttle_counts_and_resets():
+    from backend.app import throttle
+
+    throttle.clear()
+    try:
+        assert throttle.retry_after("student") == 0
+        for _ in range(throttle.MAX_ATTEMPTS):
+            throttle.register_failure("student")
+        assert throttle.retry_after("student") > 0, "перебор должен блокироваться"
+        # Блокировка адресная: соседняя учётка продолжает работать.
+        assert throttle.retry_after("teacher") == 0
+        # Успешный вход обнуляет счётчик.
+        throttle.reset("student")
+        assert throttle.retry_after("student") == 0
+    finally:
+        throttle.clear()
+
+
+def test_blank_result_covers_the_null_aggregate():
+    # SELECT SUM(...) с фильтром, который ничего не нашёл, возвращает ОДНУ
+    # строку с NULL, а не ноль строк. Формально выборка непустая, и раньше она
+    # уходила модели «на объяснение»: на вопрос «сколько студентов на
+    # факультете» пользователь получал «Произошла ошибка при попытке получить
+    # данные», хотя ошибки не было.
+    null_row = security.QueryResult(["sum"], [[""]], "", None)
+    assert not null_row.is_empty, "строка есть — значит не is_empty"
+    assert null_row.is_blank, "но показывать в ней нечего"
+
+    # Ноль — это ответ, а не пустота.
+    zero = security.QueryResult(["count"], [["0"]], "0", None)
+    assert not zero.is_blank
+
+    real = security.QueryResult(["n"], [["17"]], "17", None)
+    assert not real.is_blank and not real.is_empty
+    assert security.QueryResult([], [], "", None).is_empty
+
+
+def test_out_of_scope_is_told_apart_from_no_data():
+    # «Покажи пароли» и «добавь студента» модель уводит в faq_entries по
+    # ключевому слову и получает пусто. Это не «данных нет», а «вопрос не про
+    # наши данные» — и сказать надо именно это.
+    assert ai_agent.empty_result_answer(
+        "SELECT question, answer FROM faq_entries WHERE question ILIKE '%пароли%'"
+    ) is ai_agent.OUT_OF_SCOPE_ANSWER
+    # А вот пустой ответ по настоящим данным — обычное «не нашлось».
+    assert ai_agent.empty_result_answer(
+        "SELECT group_name FROM groups_catalog WHERE course = 9"
+    ) is ai_agent.NOTHING_FOUND_ANSWER
+    # Справка вместе с данными — уже не отказ по области.
+    assert ai_agent.empty_result_answer(
+        "SELECT f.answer FROM faq_entries f, university_units u"
+    ) is ai_agent.NOTHING_FOUND_ANSWER
+    assert ai_agent.empty_result_answer(None) is ai_agent.NOTHING_FOUND_ANSWER
+
+
+def test_tables_in_reports_what_was_touched():
+    assert security.tables_in("SELECT * FROM faq_entries") == {"faq_entries"}
+    assert security.tables_in(
+        "SELECT * FROM groups_catalog g JOIN schedule s ON s.group_id = g.id"
+    ) == {"groups_catalog", "schedule"}
+
+
+def test_blank_answers_are_detected():
+    # Ровно тот текст, который система выдала на стенде вместо ответа.
+    assert ai_agent.blank_answer_reason(
+        "На направлении «Информационная безопасность» учатся следующие группы: "
+        "[название группы 1] [название группы 2]"
+    )
+    assert ai_agent.blank_answer_reason(
+        "(перечислить группы, если бы они были в ответе)"
+    )
+    assert ai_agent.blank_answer_reason("Если данных нет, то: ничего не найдено")
+    # Нормальный ответ бланком не считается.
+    assert ai_agent.blank_answer_reason(
+        "На направлении «Информационная безопасность» учатся 17 групп: "
+        "ФИТ-0925-1, ФИТ-0924-1."
+    ) is None
 
 
 def _current_user_status(authorization):

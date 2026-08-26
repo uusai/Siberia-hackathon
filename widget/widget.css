@@ -1,0 +1,284 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   ВИДЖЕТ — стили
+   ───────────────────────────────────────────────────────────────────────
+   Та же система, что у основного интерфейса (асфальт/бумага, радиус 0 везде
+   и 75px на кнопках, цвет только как медиа), но набранная заново и компактно:
+   виджет живёт в окне 400×600 на чужом сайте, и тянуть сюда 900 строк
+   основной таблицы стилей ради четверти правил незачем.
+
+   Светлая тема — переопределение тех же токенов, как и в основном интерфейсе.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  --bg:        #302f2c;
+  --bg-soft:   #383733;
+  --fg:        #efede3;
+  --fg-70:     rgba(239, 237, 227, .70);
+  --fg-50:     rgba(239, 237, 227, .50);
+  --fg-30:     rgba(239, 237, 227, .30);
+  --fg-15:     rgba(239, 237, 227, .15);
+  --fg-08:     rgba(239, 237, 227, .08);
+  --font: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  --ease: cubic-bezier(0.19, 1, 0.22, 1);
+}
+
+:root[data-theme="light"] {
+  --bg:        #efede3;
+  --bg-soft:   #e4e1d5;
+  --fg:        #22211f;
+  --fg-70:     rgba(34, 33, 31, .74);
+  --fg-50:     rgba(34, 33, 31, .58);
+  --fg-30:     rgba(34, 33, 31, .36);
+  --fg-15:     rgba(34, 33, 31, .18);
+  --fg-08:     rgba(34, 33, 31, .08);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+[hidden] { display: none !important; }
+
+button { font: inherit; color: inherit; cursor: pointer; }
+
+:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
+
+/* ── шапка ───────────────────────────────────────────────────────── */
+.bar {
+  flex: none;
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--fg-15);
+}
+
+.bar__dot {
+  width: 9px; height: 9px; flex: none;
+  border: 1px solid var(--fg-50);
+  border-radius: 50%;
+}
+/* Зелёный тут был бы «цветом в интерфейсе» — вместо него заливка кружка. */
+.bar__dot[data-state="online"]  { background: var(--fg); border-color: var(--fg); }
+.bar__dot[data-state="offline"] { background: transparent; border-color: var(--fg-30); }
+
+.bar__title {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: .04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.bar__btn {
+  flex: none;
+  border: 0; background: transparent; padding: 4px 6px;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--fg-50);
+  transition: color .3s var(--ease);
+}
+.bar__btn:hover { color: var(--fg); }
+.bar__btn--close { font-size: 20px; line-height: 1; letter-spacing: 0; padding: 0 4px; }
+
+/* ── лента ───────────────────────────────────────────────────────── */
+.thread {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 18px;
+  scrollbar-width: thin;
+}
+
+.hello__lead {
+  margin: 0 0 14px;
+  font-size: 14px;
+  color: var(--fg-50);
+}
+
+.hello__list { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; }
+
+.hello__list button {
+  display: block; width: 100%;
+  padding: 9px 0;
+  border: 0; background: transparent;
+  text-align: left;
+  font-size: 14px;
+  color: var(--fg-70);
+  transition: color .3s var(--ease), padding-left .5s var(--ease);
+}
+.hello__list button:hover { color: var(--fg); padding-left: 8px; }
+
+/* ── реплики ─────────────────────────────────────────────────────── */
+.msg { display: grid; gap: 6px; animation: rise .5s var(--ease) both; }
+@keyframes rise { from { opacity: 0; transform: translate3d(0, 8px, 0); } }
+
+.msg__who {
+  margin: 0;
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--fg-30);
+}
+
+.msg__verdict {
+  padding: 1px 8px;
+  border: 1px solid var(--fg-15);
+  border-radius: 75px;
+  letter-spacing: .06em; text-transform: none;
+  color: var(--fg-50);
+}
+
+.msg__text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg--user .msg__text { color: var(--fg-70); }
+
+/* Отказ по правилу — не поломка: спокойная линия, приглушённый тон. */
+.msg--refusal .msg__text,
+.msg--error .msg__text {
+  padding-left: 10px;
+  border-left: 1px solid var(--fg-15);
+  color: var(--fg-50);
+}
+
+/* ── таблица ─────────────────────────────────────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--fg-15);
+}
+.table-wrap table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.table-wrap th, .table-wrap td {
+  padding: 7px 10px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--fg-08);
+}
+.table-wrap th {
+  font-weight: 400; letter-spacing: .06em; text-transform: uppercase;
+  font-size: 10px; color: var(--fg-50);
+}
+.table-wrap tr:last-child td { border-bottom: 0; }
+.table-wrap td.is-num { text-align: right; font-variant-numeric: tabular-nums; }
+.table-wrap td.is-null { color: var(--fg-30); }
+
+.table-note { margin: 0; font-size: 10px; letter-spacing: .08em; color: var(--fg-30); }
+
+/* ── SQL-запрос ──────────────────────────────────────────────────── */
+/* Свёрнут по умолчанию: посетителю нужен ответ, а не запрос. Но
+   возможность посмотреть — это то, чем ассистент над базой отличается от
+   генератора правдоподобного текста. */
+.sql { font-size: 12px; }
+
+.sql > summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--fg-30);
+  transition: color .3s var(--ease);
+}
+.sql > summary::-webkit-details-marker { display: none; }
+.sql > summary::before { content: "+ "; }
+.sql[open] > summary::before { content: "− "; }
+.sql > summary:hover { color: var(--fg-70); }
+
+.sql pre {
+  margin: 8px 0 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: var(--bg-soft);
+  border-left: 1px solid var(--fg-15);
+  font-family: var(--mono);
+  font-size: 11px; line-height: 1.5;
+  color: var(--fg-70);
+  white-space: pre-wrap; word-break: break-word;
+}
+
+.sql__copy {
+  border: 0; background: transparent; padding: 0;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--fg-30);
+  transition: color .3s var(--ease);
+}
+.sql__copy:hover { color: var(--fg); }
+
+/* ── индикатор ожидания ──────────────────────────────────────────── */
+.typing { flex: none; display: flex; gap: 5px; padding: 0 16px 10px; }
+.typing span {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--fg-30);
+  animation: blink 1.3s ease-in-out infinite;
+}
+.typing span:nth-child(2) { animation-delay: .18s; }
+.typing span:nth-child(3) { animation-delay: .36s; }
+@keyframes blink { 50% { opacity: .25; } }
+
+/* ── поле ввода ──────────────────────────────────────────────────── */
+.ask {
+  flex: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--fg-15);
+}
+
+.ask input {
+  flex: 1 1 auto;
+  padding: 10px 0;
+  border: 0; border-bottom: 1px solid var(--fg-15);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+}
+.ask input:focus { outline: none; border-bottom-color: var(--fg); }
+.ask input::placeholder { color: var(--fg-30); }
+.ask input:disabled { opacity: .5; }
+
+.ask button {
+  flex: none;
+  width: 38px; height: 38px;
+  border: 1px solid var(--fg-15);
+  border-radius: 75px;
+  background: transparent;
+  font-size: 17px; line-height: 1;
+  color: var(--fg-70);
+  transition: color .3s var(--ease), border-color .3s var(--ease);
+}
+.ask button:hover:not(:disabled) { color: var(--fg); border-color: var(--fg-50); }
+.ask button:disabled { opacity: .35; cursor: not-allowed; }
+
+.foot {
+  flex: none;
+  margin: 0;
+  padding: 0 16px 12px;
+  font-size: 10px; line-height: 1.4;
+  color: var(--fg-30);
+}
+
+/* ── страница открыта напрямую, а не в рамке ─────────────────────── */
+/* В рамке ширина задана загрузчиком (400px). На весь экран те же 400px
+   выглядят полосой посередине пустоты, поэтому в отдельном окне даём
+   читаемую колонку и поля. */
+body.standalone {
+  max-width: 720px;
+  margin: 0 auto;
+  border-left: 1px solid var(--fg-08);
+  border-right: 1px solid var(--fg-08);
+}
+body.standalone .thread { padding: 24px; }
+body.standalone .ask,
+body.standalone .bar { padding-left: 24px; padding-right: 24px; }
+body.standalone .foot { padding-left: 24px; padding-right: 24px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

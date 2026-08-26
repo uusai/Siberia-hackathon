@@ -4,8 +4,21 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="description" content="AI-ассистент университета — вопрос на естественном языке, безопасный SQL, ответ и таблица.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>AI-ассистент университета</title>
+
+<!-- Тема ставится ДО отрисовки и до загрузки style.css: иначе при выбранной
+     светлой теме страница успевает мигнуть тёмной. Скрипт крошечный и
+     намеренно встроенный — внешний файл грузился бы уже после первого кадра. -->
+<script>
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('assistant:theme'); } catch (e) { /* приватный режим */ }
+    var system = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+      ? 'light' : 'dark';
+    document.documentElement.dataset.theme = saved || system;
+  })();
+</script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,6 +50,14 @@
       <span class="wordmark__text">ассистент&nbsp;игу</span>
     </a>
 
+    <!-- Переключатель темы живёт ВНЕ блока сессии: он нужен и до входа,
+         а блок сессии на экране авторизации скрыт. -->
+    <button class="topbar__theme" id="themeBtn" type="button"
+            aria-pressed="false" title="Светлая или тёмная тема">
+      <span class="topbar__theme-dot" aria-hidden="true"></span>
+      <span id="themeText">тёмная</span>
+    </button>
+
     <nav class="topbar__session" id="session" hidden>
       <span class="topbar__user" id="sessionUser"></span>
       <!-- Роль решает, какие данные видны. Показываем её явно: иначе отказ
@@ -46,6 +67,9 @@
         <span class="topbar__dot" aria-hidden="true"></span>
         <span id="statusText">проверка</span>
       </span>
+      <!-- Лента переживает перезагрузку страницы, поэтому нужен способ её
+           очистить, не выходя из системы. -->
+      <button class="topbar__link" id="clearBtn" type="button" hidden>Очистить</button>
       <button class="pill-btn pill-btn--light" id="logoutBtn" type="button">Выйти</button>
     </nav>
   </div>
@@ -79,16 +103,31 @@
         <label class="input-group__label" for="password">Пароль</label>
         <input id="password" name="password" type="password" autocomplete="current-password"
                placeholder="••••••••" required>
+        <button class="input-group__reveal" id="revealBtn" type="button"
+                aria-controls="password" aria-pressed="false">показать</button>
       </div>
 
       <p class="auth__error" id="authError" role="alert" hidden></p>
 
-      <button class="pill-btn pill-btn--dark auth__submit" type="submit">Войти</button>
+      <button class="pill-btn pill-btn--dark auth__submit" id="authSubmit" type="submit">Войти</button>
     </form>
 
-    <p class="auth__note">
-      Демонстрационный вход: подойдёт любая непустая пара логин / пароль.
-    </p>
+    <!-- Роли решают, какие данные видны, поэтому на демонстрации вход делают
+         под всеми четырьмя по очереди. Набирать логины руками на защите —
+         потерянное время и лишний повод для опечатки. -->
+    <div class="auth__demo">
+      <p class="eyebrow">Демо-учётки стенда</p>
+      <ul class="demo-roles" id="demoRoles">
+        <li><button class="demo-role" type="button" data-login="student">студент</button></li>
+        <li><button class="demo-role" type="button" data-login="teacher">преподаватель</button></li>
+        <li><button class="demo-role" type="button" data-login="deans-office">деканат</button></li>
+        <li><button class="demo-role" type="button" data-login="administration">администрация</button></li>
+      </ul>
+      <p class="auth__note">
+        Учётные записи заводятся заранее скриптом; пароль у демо-учёток
+        совпадает с логином. Нажатие подставит пару в форму.
+      </p>
+    </div>
   </div>
 
   <footer class="auth__foot">

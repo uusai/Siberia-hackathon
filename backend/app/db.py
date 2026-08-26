@@ -78,6 +78,9 @@ POOL_WAIT_S = float(os.getenv("PG_POOL_WAIT_S", "20"))
 RETRIES = int(os.getenv("PG_RETRIES", "2"))
 RETRY_PAUSE_S = float(os.getenv("PG_RETRY_PAUSE_S", "0.5"))
 
+# Отдельный, заведомо короткий бюджет для health-проверки: см. ping().
+PING_TIMEOUT_S = float(os.getenv("PG_PING_TIMEOUT_S", "3"))
+
 # Синхронный пул: им пользуются операторские скрипты, CLI-режим
 # ai_agent.main() и тесты, где event loop'а нет. Веб-путь ходит сюда же,
 # но через asyncio.to_thread (см. afetch_all ниже): раньше эндпоинты были
@@ -135,7 +138,7 @@ def get_pool(schema: str) -> ConnectionPool:
 
 
 def _run(schema: str, sql: str, params, *, fetch: bool, session_vars=None,
-         read_only: bool = False):
+         read_only: bool = False, with_columns: bool = False):
     last_error = None
     for attempt in range(RETRIES + 1):
         try:
@@ -157,7 +160,14 @@ def _run(schema: str, sql: str, params, *, fetch: bool, session_vars=None,
                             "SELECT set_config(%s, %s, true)", (name, str(value))
                         )
                     cur.execute(sql, params)
-                    return cur.fetchall() if fetch and cur.description else []
+                    if not (fetch and cur.description):
+                        return ([], []) if with_columns else []
+                    rows = cur.fetchall()
+                    if with_columns:
+                        # cur.description живёт только до выхода из блока —
+                        # имена снимаем здесь, а не у вызывающего кода.
+                        return [d.name for d in cur.description], rows
+                    return rows
         except _RETRYABLE as e:
             # Обрыв соединения или нехватка слотов — имеет смысл повторить.
             last_error = e
@@ -186,6 +196,17 @@ def fetch_all(schema: str, sql, params=None, session_vars=None,
                 read_only=read_only)
 
 
+def fetch_all_with_columns(schema: str, sql, params=None, session_vars=None,
+                           read_only: bool = False) -> tuple[list[str], list[tuple]]:
+    """То же, что fetch_all(), но возвращает ещё и имена колонок.
+
+    Нужно чат-пути: раньше строки склеивались в текст «a|b|c» и уходили только
+    в промпт модели, а до фронтенда доезжала одна проза. Таблицу в ответе он
+    поэтому пытался выпарсить обратно из текста. Имена колонок есть в
+    cur.description и всегда были — их просто выбрасывали.
+    """
+    return _run(schema, sql, params, fetch=True, session_vars=session_vars,
+                read_only=read_only, with_columns=True)
 
 
 def execute(schema: str, sql: str, params=None) -> None:
@@ -227,9 +248,42 @@ async def afetch_all(schema: str, sql, params=None, session_vars=None,
     )
 
 
+async def afetch_all_with_columns(
+    schema: str, sql, params=None, session_vars=None, read_only: bool = False
+) -> tuple[list[str], list[tuple]]:
+    """Асинхронный вариант fetch_all_with_columns(). Контракт тот же."""
+    return await asyncio.to_thread(
+        fetch_all_with_columns, schema, sql, params, session_vars, read_only
+    )
+
+
 async def aexecute(schema: str, sql, params=None) -> None:
     """Асинхронный запрос без чтения результата."""
     await asyncio.to_thread(execute, schema, sql, params)
+
+
+def ping(schema: str = "assistant") -> bool:
+    """Жива ли БД. ОДНА попытка, без повторов.
+
+    Через _run() ходить нельзя: он ретраит до RETRIES раз с паузами, то есть
+    на упавшей базе отвечает до полуминуты. Этот вызов обслуживает /health,
+    который фронтенд опрашивает каждые 25 секунд, — он обязан вернуться
+    быстро и с ответом «нет», а не подвесить опрос.
+    """
+    try:
+        with get_pool(schema).connection(timeout=PING_TIMEOUT_S) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return True
+    except Exception:
+        # Любая причина — обрыв, таймаут, нет слотов — для health одинакова.
+        return False
+
+
+async def aping(schema: str = "assistant") -> bool:
+    """Асинхронный вариант ping()."""
+    return await asyncio.to_thread(ping, schema)
 
 
 async def aclose_all() -> None:

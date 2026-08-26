@@ -60,6 +60,29 @@ def _query(sql: str):
 # а не сырые таблицы. Четвёртый элемент отмечает вопросы, где пустой
 # результат — правильный ответ, а не отсутствие данных.
 ANSWERABLE = [
+    # Вопрос, на котором система выдала «[название группы 1]»: модель
+    # соединяла groups с edu_programs, а это разные контуры без общих
+    # идентификаторов. Данные при этом были — 17 групп.
+    ("Какие группы учатся на направлении информационная безопасность", "student",
+     "SELECT group_name, course, program_name, students_count FROM groups_catalog "
+     "WHERE search_vector @@ plainto_tsquery('russian', 'информационная безопасность') "
+     "ORDER BY course, group_name"),
+
+    ("На каком направлении учится группа", "student",
+     "SELECT group_name, program_name, faculty_name, course FROM groups_catalog "
+     "WHERE group_name = 'ФИТ-0925-1'"),
+
+    # Сводки отдают НАЗВАНИЕ факультета, а не его идентификатор (миграция 016).
+    ("Средний балл ЕГЭ по факультетам", "administration",
+     "SELECT faculty_name, round(avg(avg_score),1) FROM ege_scores_summary "
+     "GROUP BY faculty_name ORDER BY 2 DESC"),
+
+    # Разбор приложения к Правилам приёма чинился скриптом
+    # fix_program_profiles.py: до него это направление называлось «Специальное».
+    ("Направление «Специальное (дефектологическое) образование»", "student",
+     "SELECT name, profile FROM edu_programs "
+     "WHERE search_vector @@ plainto_tsquery('russian', 'дефектологическое')"),
+
     ("Топ-5 студентов факультета IT со средним баллом", "deans-office",
      "SELECT last_name, first_name, group_name, avg_score FROM student_rankings "
      "WHERE faculty_name ILIKE '%информацион%' ORDER BY avg_score DESC LIMIT 5"),
@@ -69,9 +92,24 @@ ANSWERABLE = [
      "WHERE group_name = 'ФИТ-0925-1' GROUP BY last_name, first_name "
      "ORDER BY debts DESC LIMIT 3"),
 
+    # ВНИМАНИЕ на историю этого кейса. Здесь стояло
+    #   SELECT count(*) FROM academic_debts WHERE ... AND debts_count > 0
+    # и это давало 400 — но academic_debts группируется по студенту И кафедре,
+    # то есть COUNT(*) считает пары «студент × кафедра», а не людей. Тест
+    # проверял непустоту, поэтому неверный запрос жил в нём как эталонный.
+    # Правильный ответ отдаёт department_debts (миграция 017), где строка —
+    # одна кафедра, а debtors_count — именно люди.
     ("Сколько должников на кафедре программной инженерии", "deans-office",
-     "SELECT count(*) FROM academic_debts "
-     "WHERE department_name ILIKE '%программной инженерии%' AND debts_count > 0"),
+     "SELECT department_name, students_total, debtors_count, debts_total "
+     "FROM department_debts "
+     "WHERE search_vector @@ plainto_tsquery('russian', 'программная инженерия')"),
+
+    ("Сколько всего должников в университете", "deans-office",
+     "SELECT count(*) FROM student_debts WHERE debts_count > 0"),
+
+    ("Процент сдавших дисциплину с первой попытки — одним числом", "teacher",
+     "SELECT subject_name, first_attempt_pass_rate, grades_count "
+     "FROM subject_summary WHERE subject_name = 'Базы данных'"),
 
     ("Процент сдавших «Базы данных» с первой попытки", "teacher",
      "SELECT subject_name, sum(first_attempt_passed), sum(first_attempt_total), "

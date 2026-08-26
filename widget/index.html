@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Ассистент приёмной комиссии</title>
+
+<!-- Тема до отрисовки: иначе при светлой успевает мигнуть тёмная. -->
+<script>
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('isu-widget:theme'); } catch (e) {}
+    var system = window.matchMedia
+      && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = saved || system;
+  })();
+</script>
+
+<link rel="stylesheet" href="widget.css">
+</head>
+
+<body>
+
+<header class="bar">
+  <span class="bar__dot" aria-hidden="true"></span>
+  <h1 class="bar__title" id="title">Ассистент приёмной комиссии</h1>
+
+  <button class="bar__btn" id="themeBtn" type="button" title="Светлая или тёмная тема">
+    <span id="themeText">тёмная</span>
+  </button>
+  <button class="bar__btn bar__btn--close" id="closeBtn" type="button" aria-label="Свернуть">×</button>
+</header>
+
+<main class="thread" id="thread" role="log" aria-live="polite">
+  <section class="hello" id="hello">
+    <p class="hello__lead">
+      Спрашивайте обычными словами — про направления, вступительные испытания,
+      сроки, стоимость обучения, корпуса и расписание занятий.
+    </p>
+    <ul class="hello__list" id="hints">
+      <li><button type="button">Что сдавать на прикладную информатику?</button></li>
+      <li><button type="button">До какого числа подают документы?</button></li>
+      <li><button type="button">Сколько стоит обучение на юриспруденции?</button></li>
+      <li><button type="button">Во сколько начинается вторая пара?</button></li>
+      <li><button type="button">Какое расписание у группы ФИТ-0925-1 сегодня?</button></li>
+    </ul>
+  </section>
+</main>
+
+<div class="typing" id="typing" hidden><span></span><span></span><span></span></div>
+
+<form class="ask" id="ask" autocomplete="off">
+  <input id="input" type="text" maxlength="600" placeholder="Ваш вопрос…" enterkeyhint="send">
+  <button type="submit" id="send" aria-label="Отправить">→</button>
+</form>
+
+<!-- Формулировка точная: приём — по официальным данным ИГУ, расписание — из
+     учебной системы. Обещать «всё официальное» нельзя: часть данных стенда
+     демонстрационная, и вводить посетителя в заблуждение не за чем. -->
+<p class="foot">
+  Приём — по официальным данным ИГУ. Персональные сведения и ФИО
+  преподавателей недоступны.
+</p>
+
+<script src="app.js"></script>
+</body>
+</html>

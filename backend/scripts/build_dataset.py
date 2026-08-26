@@ -58,6 +58,94 @@ FORMS = {"Очная": "очная", "Заочная": "заочная", "Очн
 FORM_TAIL_RE = re.compile(r"^(.*?)\s*(Очно-заочная|Очная|Заочная)\s*$")
 
 
+def _top_level_groups(text: str) -> list[tuple[int, int, str]]:
+    """Скобочные группы ВЕРХНЕГО уровня: (начало, конец, содержимое)."""
+    groups: list[tuple[int, int, str]] = []
+    depth = 0
+    start = -1
+    for index, char in enumerate(text):
+        if char == "(":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                groups.append((start, index + 1, text[start + 1:index]))
+    return groups
+
+
+def _balance(text: str) -> str:
+    """Дописывает недостающие закрывающие скобки.
+
+    В тексте, извлечённом из PDF, часть скобок теряется: в приложении к
+    Правилам приёма встречается «Информационная безопасность (Безопасность
+    автоматизированных систем (по отраслям ...» с двумя открывающими и одной
+    закрывающей. Без выравнивания разбор по уровням вложенности не находит ни
+    одной завершённой группы.
+    """
+    missing = text.count("(") - text.count(")")
+    return text + ")" * missing if missing > 0 else text
+
+
+# Хвостовая пометка вида «- Б» после профиля: одиночная буква, к названию
+# отношения не имеющая.
+_TRAILING_MARK_RE = re.compile(r"\s*[-–]\s*[А-ЯA-Z]\.?\s*$")
+
+
+def split_title_and_profile(title: str) -> tuple[str, str | None]:
+    """Делит «Название (Уточнение) (Профиль)» на название и профиль.
+
+    ЗАЧЕМ ОТДЕЛЬНОЙ ФУНКЦИЕЙ. Раньше здесь стоял `re.search(r"\\((.*)\\)(.*)$")`
+    — жадный, то есть захватывающий от ПЕРВОЙ открывающей скобки до ПОСЛЕДНЕЙ
+    закрывающей. На «Педагогическое образование (с двумя профилями подготовки)
+    (Математика -Информатика)» он выдавал профиль
+    «с двумя профилями подготовки) (Математика -Информатика» — с посторонней
+    скобкой посередине и потерянным уточнением из названия.
+
+    Поражено это было у 26 записей каталога из 113, а заметно становилось лишь
+    у пяти: у остальных скобки случайно сходились по количеству, и проверка
+    баланса их не ловила.
+
+    Теперь скобочные группы разбираются по уровням вложенности: профиль — это
+    ПОСЛЕДНЯЯ группа верхнего уровня, всё до неё остаётся в названии.
+    """
+    title = _balance(title.strip())
+    groups = _top_level_groups(title)
+    if not groups:
+        return title.strip(" -–"), None
+
+    start, end, profile = groups[-1]
+    # Название — всё ДО последней группы. Хвост после неё в название не
+    # попадает никогда: там либо служебная пометка «- Б», либо уточнение,
+    # относящееся к профилю. Из-за обратного порядка в первой редакции
+    # направления назывались «Физика -Б».
+    name = title[:start].strip()
+
+    # Хвост после профиля различает одноимённые программы («Китайский язык»),
+    # поэтому короткие пометки отбрасываем, а осмысленный текст сохраняем.
+    leftover = title[end:].strip(" -–*")
+    if leftover and len(leftover) > 2:
+        profile = f"{profile} {leftover}"
+
+    # «-(Дополнительное образование)» — ещё один след потерянной скобки:
+    # в источнике это перечисление двух профилей через дефис.
+    profile = profile.replace("-(", "- ")
+    profile = _TRAILING_MARK_RE.sub("", profile)
+    # Скобки могли разъехаться после замены выше.
+    while profile.count(")") > profile.count("("):
+        profile = profile.rsplit(")", 1)[0] + profile.rsplit(")", 1)[1]
+    profile = _clean(profile)
+
+    name = _clean(name) or ""
+    # «Прикладная информатика (Прикладная информатика (Разработка ...))»:
+    # название продублировано внутри профиля, внутренняя часть и есть профиль.
+    if profile and name and profile.startswith(f"{name} (") and profile.endswith(")"):
+        profile = _clean(profile[len(name) + 2:-1]) or profile
+
+    return name.strip(" -–"), profile
+
+
 def _clean(text: str | None) -> str | None:
     """Убирает неразрывные пробелы, переносы и остатки подписей полей."""
     if text is None:
@@ -195,18 +283,11 @@ def parse_programs() -> tuple[list[dict], list[dict], list[dict]]:
         exam_lines = rest[form_index + skip:]
 
         title = _clean(" ".join(rest[:form_index] + [head_tail])) or ""
-        profile = None
-        # Берём последнюю закрывающую скобку: профиль может содержать
-        # вложенные скобки, а после него иногда идёт уточнение вроде
-        # «Китайский язык» — именно оно различает две одноимённые программы.
-        match = re.search(r"\((.*)\)(.*)$", title, re.S)
-        if match:
-            profile = _clean(match.group(1))
-            leftover = _clean(match.group(2).strip(" -–*"))
-            if leftover and len(leftover) > 2:
-                profile = f"{profile} {leftover}" if profile else leftover
-            title = title[:match.start()]
-        name = (_clean(title) or "").strip(" -–")
+        # Профиль — ПОСЛЕДНЯЯ скобочная группа верхнего уровня, уточнение вроде
+        # «(с двумя профилями подготовки)» остаётся в названии.
+        # См. split_title_and_profile(): прежний жадный regex склеивал обе
+        # группы в одну строку с посторонней скобкой посередине.
+        name, profile = split_title_and_profile(title)
 
         program = {
             "unit": unit["official_name"],

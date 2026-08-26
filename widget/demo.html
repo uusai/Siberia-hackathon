@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Страница вуза — пример встраивания виджета</title>
+
+<!--
+  Это НЕ часть продукта, а образец чужого сайта: намеренно чужая вёрстка,
+  свои цвета, свой шрифт. Она показывает главное свойство виджета — он
+  встраивается одной строкой и не конфликтует со стилями страницы-хозяина,
+  потому что живёт в iframe.
+-->
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Georgia, "Times New Roman", serif;
+    color: #1e2a3a;
+    background: #f4f6f9;
+    line-height: 1.6;
+  }
+  header {
+    background: #1b3a6b;
+    color: #fff;
+    padding: 18px 32px;
+    display: flex; align-items: center; gap: 20px;
+  }
+  header b { font-size: 19px; letter-spacing: .3px; }
+  nav { margin-left: auto; display: flex; gap: 22px; font-size: 14px; }
+  nav a { color: #cfe0ff; text-decoration: none; }
+  nav a:hover { color: #fff; text-decoration: underline; }
+
+  .hero { background: #fff; border-bottom: 1px solid #dde3ec; padding: 48px 32px; }
+  .hero h1 { margin: 0 0 12px; font-size: 34px; font-weight: normal; }
+  .hero p { margin: 0; max-width: 62ch; color: #4a5a70; }
+
+  main { max-width: 900px; margin: 0 auto; padding: 36px 32px 120px; }
+  h2 { font-size: 22px; font-weight: normal; margin: 34px 0 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
+  .card { background: #fff; border: 1px solid #dde3ec; padding: 18px 20px; }
+  .card h3 { margin: 0 0 6px; font-size: 16px; font-weight: normal; color: #1b3a6b; }
+  .card p { margin: 0; font-size: 14px; color: #5a6a80; }
+  .note {
+    margin-top: 34px; padding: 16px 20px;
+    background: #eef3fb; border-left: 3px solid #1b3a6b;
+    font-size: 14px;
+  }
+  code {
+    font-family: ui-monospace, Consolas, monospace;
+    background: #e7edf6; padding: 2px 6px; font-size: 13px;
+  }
+  pre {
+    background: #1b2532; color: #e7edf6; padding: 14px 16px;
+    overflow-x: auto; font-size: 13px; line-height: 1.5;
+  }
+</style>
+</head>
+
+<body>
+
+<header>
+  <b>Иркутский государственный университет</b>
+  <nav>
+    <a href="#">Об университете</a>
+    <a href="#">Абитуриенту</a>
+    <a href="#">Студенту</a>
+    <a href="#">Контакты</a>
+  </nav>
+</header>
+
+<section class="hero">
+  <h1>Приём 2026</h1>
+  <p>
+    Приём документов, перечни вступительных испытаний, количество мест и
+    стоимость обучения по всем направлениям подготовки.
+  </p>
+</section>
+
+<main>
+  <h2>Разделы для поступающих</h2>
+  <div class="cards">
+    <div class="card"><h3>Направления подготовки</h3><p>113 программ бакалавриата и специалитета.</p></div>
+    <div class="card"><h3>Вступительные испытания</h3><p>Перечни предметов и минимальные баллы.</p></div>
+    <div class="card"><h3>Сроки приёма</h3><p>Даты подачи документов и согласий.</p></div>
+    <div class="card"><h3>Общежития</h3><p>Условия предоставления мест иногородним.</p></div>
+  </div>
+
+  <div class="note">
+    <b>Виджет ассистента</b> — кнопка в правом нижнем углу этой страницы.
+    Он отвечает по официальным данным приёмной кампании и не требует входа:
+    посетителю сайта незачем заводить логин, чтобы спросить, что сдавать на
+    прикладную информатику.
+  </div>
+
+  <h2>Как встроить</h2>
+  <p>Одна строка перед закрывающим <code>&lt;/body&gt;</code>:</p>
+<pre>&lt;script src="http://localhost:8080/widget.js" defer&gt;&lt;/script&gt;</pre>
+
+  <p>Необязательные настройки — атрибутами тега:</p>
+<pre>&lt;script src="http://localhost:8080/widget.js"
+        data-api="http://localhost:8000"
+        data-title="Спросить про поступление"
+        data-position="right"
+        defer&gt;&lt;/script&gt;</pre>
+
+  <p>
+    Виджет открывается в <code>iframe</code>, поэтому его стили и стили сайта
+    не пересекаются: страница не может перекрасить виджет, виджет не протечёт
+    в страницу. На документе он создаёт ровно два элемента — кнопку и рамку.
+  </p>
+</main>
+
+<!-- ← вот эта строка и есть всё встраивание -->
+<script src="widget.js" data-title="Спросить про поступление" defer></script>
+
+</body>
+</html>

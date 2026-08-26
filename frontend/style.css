@@ -84,6 +84,40 @@
   --dur-micro:  0.4s;
 }
 
+/* ═══ 1a. СВЕТЛАЯ ТЕМА ════════════════════════════════════════════════
+   Вся иерархия в системе построена на прозрачностях ОДНОГО цвета поверх
+   ОДНОГО фона (--paper-06 … --paper-70 поверх --color-asphalt). Поэтому
+   светлая тема — это не второй набор правил, а переопределение тех же
+   токенов: асфальт и бумага меняются местами, прозрачности пересчитываются
+   от тёмного. Ни одно правило ниже про тему не знает.
+
+   Переключение по data-theme на <html>, а не по prefers-color-scheme:
+   выбор пользователя должен побеждать настройку системы. Начальное значение
+   ставится в <head> до отрисовки — иначе тёмная тема успевает мигнуть.
+   ═══════════════════════════════════════════════════════════════════ */
+:root[data-theme="light"] {
+  --color-asphalt:    #efede3;   /* фон — бумага */
+  --color-asphalt-2:  #e4e1d5;
+  --color-paper:      #22211f;   /* текст — почти асфальт */
+
+  --paper-06:  rgba(34, 33, 31, .06);
+  --paper-10:  rgba(34, 33, 31, .10);
+  --paper-15:  rgba(34, 33, 31, .15);
+  --paper-20:  rgba(34, 33, 31, .22);
+  --paper-30:  rgba(34, 33, 31, .34);
+  --paper-40:  rgba(34, 33, 31, .46);
+  --paper-50:  rgba(34, 33, 31, .58);
+  --paper-70:  rgba(34, 33, 31, .74);
+
+  /* Стекло на светлом фоне должно светлеть, а не темнеть. */
+  --glass-bg: rgba(239, 237, 227, .78);
+}
+
+/* Иридесценция задумана как свечение в темноте: на светлом фоне те же пятна
+   выглядят грязью. Гасим их почти до нуля — фон остаётся живым, но чистым. */
+:root[data-theme="light"] .iridescence__flow { opacity: .16; }
+:root[data-theme="light"] .iridescence__grain { opacity: .25; }
+
 /* ═══ 2. БАЗА ═════════════════════════════════════════════════════════ */
 *, *::before, *::after { box-sizing: border-box; }
 
@@ -305,10 +339,52 @@ body[data-screen="chat"] .topbar {
 .wordmark__mark svg { width: 100%; height: 100%; stroke-width: 1.4; }
 .wordmark__text { text-transform: uppercase; letter-spacing: .1em; font-size: var(--text-caption); }
 
-.topbar__session {
+/* Переключатель темы. margin-left:auto именно здесь, а не на блоке сессии:
+   кнопка нужна и на экране входа, где блок сессии скрыт, и без этого она
+   прижималась бы к логотипу. */
+.topbar__theme {
   margin-left: auto;
+  display: inline-flex; align-items: center; gap: var(--spacing-8);
+  padding: 5px 14px;
+  border: 1px solid var(--paper-20);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-family: inherit;
+  font-size: var(--text-micro);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--paper-40);
+  cursor: pointer;
+  transition:
+    color var(--dur-micro) var(--ease-glide),
+    border-color var(--dur-micro) var(--ease-glide);
+}
+.topbar__theme:hover { color: var(--color-paper); border-color: var(--paper-50); }
+
+/* Кружок наполовину закрашен — метафора самого переключения, без иконок. */
+.topbar__theme-dot {
+  width: 9px; height: 9px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  background: linear-gradient(90deg, currentColor 50%, transparent 50%);
+}
+
+.topbar__session {
   display: flex; align-items: center; gap: var(--spacing-28);
 }
+
+/* Текстовое действие в шапке: рядом с кнопкой-пилюлей, но тише её. */
+.topbar__link {
+  border: 0; background: transparent; padding: 0;
+  font-family: inherit;
+  font-size: var(--text-micro);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--paper-40);
+  cursor: pointer;
+  transition: color var(--dur-micro) var(--ease-glide);
+}
+.topbar__link:hover { color: var(--color-paper); }
 
 .topbar__user {
   font-size: var(--text-caption);
@@ -419,6 +495,55 @@ body[data-screen="chat"] .topbar {
   color: var(--paper-30);
 }
 
+/* — «показать пароль»: микро-действие внутри поля, без иконок —
+   Правая часть подчёркивания свободна, поэтому кнопка садится туда и не
+   добавляет строки в форму. */
+.input-group__reveal {
+  position: absolute;
+  right: 0;
+  bottom: 13px;
+  border: 0; background: transparent; padding: 0;
+  font-family: inherit;
+  font-size: var(--text-micro);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--paper-30);
+  cursor: pointer;
+  transition: color var(--dur-micro) var(--ease-glide);
+}
+.input-group__reveal:hover { color: var(--color-paper); }
+
+/* — Демо-учётки: подставляют пару в форму, но не входят сами —
+   Вход остаётся осознанным действием: видно, под кем заходишь. */
+.auth__demo {
+  grid-column: 2;
+  display: grid;
+  gap: var(--spacing-12);
+}
+
+.demo-roles {
+  display: flex; flex-wrap: wrap;
+  gap: var(--spacing-8);
+  margin: 0; padding: 0;
+  list-style: none;
+}
+
+.demo-role {
+  padding: 6px 16px;
+  border: 1px solid var(--paper-20);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-family: inherit;
+  font-size: var(--text-micro);
+  letter-spacing: .06em;
+  color: var(--paper-50);
+  cursor: pointer;
+  transition:
+    color var(--dur-micro) var(--ease-glide),
+    border-color var(--dur-micro) var(--ease-glide);
+}
+.demo-role:hover { color: var(--color-paper); border-color: var(--paper-50); }
+
 .auth__foot {
   width: 100%;
   max-width: var(--page-max-width);
@@ -528,6 +653,28 @@ body[data-screen="chat"] .topbar {
   font-variant-numeric: tabular-nums;
 }
 
+/* Длительность ответа. Отделена от времени реплики точкой-разделителем:
+   одно — когда спросили, другое — сколько система думала. */
+.msg__took {
+  color: var(--paper-20);
+  letter-spacing: .08em;
+  font-variant-numeric: tabular-nums;
+}
+.msg__took::before { content: "· "; }
+
+/* Почему ассистент не ответил. Рамкой, а не цветом: цвет в системе занят
+   иридесценцией и в интерфейсных элементах не используется. */
+.msg__verdict {
+  flex: none;
+  padding: 2px 10px;
+  border: 1px solid var(--paper-20);
+  border-radius: var(--radius-pill);
+  letter-spacing: .08em;
+  text-transform: none;
+  color: var(--paper-50);
+}
+.msg--error .msg__verdict { border-color: var(--paper-40); color: var(--paper-70); }
+
 /* Действия под ответом: «скопировать», «повторить». Текстовые, без рамок —
    в системе кнопка-пилюля зарезервирована за первичными действиями. */
 .msg__action {
@@ -556,6 +703,18 @@ body[data-screen="chat"] .topbar {
   overflow-wrap: anywhere;
 }
 .msg--user .msg__text { color: var(--paper-70); }
+
+/* ОТКАЗ — это работающее правило, а не поломка, и выглядеть он должен
+   спокойно: та же лента, лишь приглушённый тон и тонкая линия слева.
+   Раньше отказы вообще не отличались от ответов: фронтенд угадывал их
+   регулярным выражением по тексту, а бэкенд давно отдаёт человеческую фразу
+   без служебных скобок — условие не срабатывало ни разу. */
+.msg--refusal .msg__text {
+  border-left: 1px solid var(--paper-20);
+  padding-left: var(--spacing-12);
+  color: var(--paper-50);
+}
+
 .msg--error .msg__text {
   border-left: 1px solid var(--paper-30);
   padding-left: var(--spacing-12);

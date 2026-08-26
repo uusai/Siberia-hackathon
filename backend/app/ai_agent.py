@@ -82,17 +82,124 @@ DB_NAME = os.getenv("DB_NAME")
 # ссылка и так лежит в колонке source_url рядом. В промпт они не попадают.
 _NOISE_FK_COLUMNS = {"source_id"}
 
+# Списка «висячих колонок представлений» здесь больше нет.
+#
+# Он был: ege_scores_summary.faculty_id и students_summary.faculty_id ведут в
+# скрытую от модели faculties, а внешних ключей у представлений не бывает, и
+# автоматический фильтр ниже их не находил. Но перечень в коде описывал дефект,
+# а не устранял его. Устранён он там, где и возник, — в самих представлениях:
+# миграция 016 отдаёт faculty_name вместо faculty_id. Заодно появилась
+# возможность, которой не было: сгруппировать баллы ЕГЭ по факультетам.
+
 
 def build_model_uri() -> str:
     return f"gpt://{FOLDER_ID}/{MODEL_NAME}"
 
 
-def get_db_schema(allowed: set[str] | None = None) -> str:
+def fetch_foreign_keys() -> tuple[list[tuple], str | None]:
+    """Все внешние ключи схемы assistant: (строки, текст_ошибки).
+
+    Забирается ОДИН раз на сборку промпта и используется дважды — блоком
+    связей и фильтром висячих ссылок в блоке схемы. Раньше это были два
+    независимых запроса, и фильтровать схему по связям было нечем.
+    """
+    query = (
+        "SELECT "
+        "tc.table_name AS from_table, "
+        "kcu.column_name AS from_column, "
+        "ccu.table_name AS to_table, "
+        "ccu.column_name AS to_column "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+        "JOIN information_schema.constraint_column_usage ccu "
+        "  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
+        "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'assistant' "
+        "ORDER BY tc.table_name;"
+    )
+    try:
+        return db.fetch_all("assistant", query, read_only=True), None
+    except db.DBUnavailable as e:
+        return [], f"[Не удалось получить связи БД] {e}"
+    except psycopg.Error as e:
+        return [], f"[Ошибка получения связей БД] {str(e).strip()}"
+
+
+def fetch_object_comments() -> dict[str, str]:
+    """Подписи (COMMENT ON) к таблицам и представлениям схемы assistant.
+
+    Зачем они в промпте. По имени и списку колонок невозможно отличить
+    «строка = студент» от «строка = студент × кафедра»: выглядят они
+    одинаково. Из-за этого на вопрос «сколько должников на кафедре» ассистент
+    просуммировал debts_count у academic_debts и ответил «10760 студентов с
+    долгами» — при 4981 студенте в университете.
+
+    Разрез представления — свойство данных, поэтому и записан он там же, в
+    базе (миграция 017), а не продублирован отдельным списком в коде. Здесь
+    он только читается: новая вьюха с подписью объяснит себя сама.
+    """
+    query = (
+        "SELECT c.relname, obj_description(c.oid) "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'assistant' AND c.relkind IN ('r', 'v', 'm') "
+        "  AND obj_description(c.oid) IS NOT NULL"
+    )
+    try:
+        rows = db.fetch_all("assistant", query, read_only=True)
+    except (db.DBUnavailable, psycopg.Error):
+        # Подписи — уточнение, а не основа промпта: без них схема остаётся
+        # рабочей, поэтому сбой здесь не должен ронять сборку промпта.
+        return {}
+    return {name: " ".join(text.split()) for name, text in rows}
+
+
+def _dangling_fk_columns(
+    foreign_keys: list[tuple], allowed: set[str]
+) -> set[tuple[str, str]]:
+    """Колонки-внешние ключи, ведущие в НЕВИДИМЫЙ роли объект.
+
+    Ради чего это всё. На вопрос «какие группы учатся на направлении
+    информационная безопасность» модель выдала:
+
+        SELECT g.name FROM groups g
+        JOIN edu_programs ep ON g.program_id = ep.id
+
+    и получила ноль строк, потому что groups.program_id ведёт в programs
+    (демо-контур, 13 направлений), а edu_programs — официальный каталог на 113.
+    Идентификаторы там несопоставимы: program_id не больше 13, а нужные строки
+    каталога имеют id 108 и 109.
+
+    Виновата не модель. Таблица programs от неё скрыта, поэтому связь
+    groups.program_id -> programs.id выбрасывалась из блока связей, и в промпте
+    оставалась колонка program_id БЕЗ ЕДИНОЙ объявленной связи — рядом с
+    заманчиво подходящим по смыслу edu_programs. Соединить их было
+    единственным доступным ходом.
+
+    Лечение общее, а не заплатка на один случай: колонку, ведущую в скрытый
+    объект, модель просто не видит. Соединить по ней невозможно.
+    Таких колонок сейчас пять: groups.program_id, curriculum.program_id,
+    admission_campaigns.program_id, teachers.department_id,
+    subjects.department_id — и у роли student к ним добавляется
+    schedule.curriculum_id.
+    """
+    return {
+        (from_table, from_col)
+        for from_table, from_col, to_table, _ in foreign_keys
+        if to_table not in allowed
+    }
+
+
+def get_db_schema(
+    allowed: set[str] | None = None, foreign_keys: list[tuple] | None = None
+) -> str:
     """Схема БД для промпта.
 
     allowed — набор таблиц, доступных роли. Показывать модели то, чего ей
     нельзя, вредно: она исправно построит запрос, проверка исправно его
     отклонит, а пользователь увидит отказ вместо ответа.
+
+    foreign_keys — список связей, по которому вычищаются висячие ссылки
+    (см. _dangling_fk_columns). Если не передан, забирается сам.
     """
     query = (
         "SELECT table_name, column_name, data_type "
@@ -109,10 +216,17 @@ def get_db_schema(allowed: set[str] | None = None) -> str:
 
     if allowed is None:
         allowed = security.ALLOWED_TABLES
+    if foreign_keys is None:
+        foreign_keys, _ = fetch_foreign_keys()
+
+    dangling = _dangling_fk_columns(foreign_keys, allowed)
+    comments = fetch_object_comments()
 
     tables: dict[str, list[str]] = {}
     for table, column, dtype in rows:
         if table not in allowed:
+            continue
+        if (table, column) in dangling:
             continue
         tables.setdefault(table, []).append(f"{column} ({dtype})")
 
@@ -122,10 +236,15 @@ def get_db_schema(allowed: set[str] | None = None) -> str:
     lines = ["Доступные таблицы и колонки в БД:"]
     for table in sorted(tables):
         lines.append(f"- {table}: {', '.join(tables[table])}")
+        note = comments.get(table)
+        if note:
+            lines.append(f"    {note}")
     return "\n".join(lines)
 
 
-def get_db_relationships(allowed: set[str] | None = None) -> str:
+def get_db_relationships(
+    allowed: set[str] | None = None, foreign_keys: list[tuple] | None = None
+) -> str:
     """Связи между таблицами для промпта.
 
     allowed — набор объектов, доступных роли. Фильтр по нему обязателен по
@@ -137,29 +256,13 @@ def get_db_relationships(allowed: set[str] | None = None) -> str:
     if allowed is None:
         allowed = security.ALLOWED_TABLES
 
-    query = (
-        "SELECT "
-        "tc.table_name AS from_table, "
-        "kcu.column_name AS from_column, "
-        "ccu.table_name AS to_table, "
-        "ccu.column_name AS to_column "
-        "FROM information_schema.table_constraints tc "
-        "JOIN information_schema.key_column_usage kcu "
-        "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-        "JOIN information_schema.constraint_column_usage ccu "
-        "  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
-        "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'assistant' "
-        "ORDER BY tc.table_name;"
-    )
-    try:
-        rows = db.fetch_all("assistant", query, read_only=True)
-    except db.DBUnavailable as e:
-        return f"[Не удалось получить связи БД] {e}"
-    except psycopg.Error as e:
-        return f"[Ошибка получения связей БД] {str(e).strip()}"
+    if foreign_keys is None:
+        foreign_keys, error = fetch_foreign_keys()
+        if error:
+            return error
 
     lines = []
-    for from_table, from_col, to_table, to_col in rows:
+    for from_table, from_col, to_table, to_col in foreign_keys:
         if from_col in _NOISE_FK_COLUMNS:
             continue
         if from_table not in allowed or to_table not in allowed:
@@ -178,8 +281,11 @@ def build_sql_system_prompt(role: str | None = None) -> str:
     будет уверенно строить запросы к закрытым для неё таблицам.
     """
     allowed = security.allowed_tables_for(role)
-    schema = get_db_schema(allowed)
-    relationships = get_db_relationships(allowed)
+    # Связи забираем один раз: они нужны и блоку связей, и фильтру висячих
+    # ссылок внутри блока схемы.
+    foreign_keys, fk_error = fetch_foreign_keys()
+    schema = get_db_schema(allowed, foreign_keys)
+    relationships = fk_error or get_db_relationships(allowed, foreign_keys)
     if not relationships:
         # Связи не получены (БД недоступна или роли не видно ни одной пары
         # связанных объектов). Врать про схему нельзя: пусть модель знает,
@@ -237,7 +343,7 @@ def build_sql_system_prompt(role: str | None = None) -> str:
     # прежним, и координировать раскладку с состоянием БД руками не нужно.
 
     admission_rule = ""
-    if "programs_admission" in schema:
+    if "programs_admission" in allowed:
         admission_rule = (
             "\n10. ВОПРОСЫ О ПОСТУПЛЕНИИ. Официальные сведения об ИГУ лежат "
             "отдельно от учебного контура. Маршрут такой:\n"
@@ -303,19 +409,40 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         )
 
     schedule_rule = ""
-    if "schedule_calendar" in schema:
+    # Объект расписания зависит от роли: сотрудникам — schedule_calendar со
+    # всеми полями, гостю из публичного виджета — public_schedule без ФИО
+    # преподавателей (миграция 018). Правило одно, имя объекта подставляется.
+    schedule_view = None
+    if "schedule_calendar" in allowed:
+        schedule_view = "schedule_calendar"
+    elif "public_schedule" in allowed:
+        schedule_view = "public_schedule"
+
+    if schedule_view:
+        who_column = (
+            "teacher_name, " if schedule_view == "schedule_calendar" else ""
+        )
+        who_question = (
+            "«кто ведёт», " if schedule_view == "schedule_calendar" else ""
+        )
+        no_teacher_note = "" if schedule_view == "schedule_calendar" else (
+            "   ФИО преподавателей в этом представлении НЕТ и получить их "
+            "неоткуда. На вопрос «кто ведёт пару» отвечай, что такие сведения "
+            "здесь не выдаются, — не подставляй вместо них ничего.\n"
+        )
         schedule_rule = (
             "\n11. РАСПИСАНИЕ ПО ДАТАМ. Для вопросов «что сегодня», «что "
             "завтра», «расписание на 15 сентября», «какая следующая пара», "
-            "«во сколько», «в какой аудитории», «кто ведёт» используй "
-            "schedule_calendar: там уже есть lesson_date, starts_at, ends_at, "
-            "lesson_type, subject_name, teacher_name, group_name, building, "
+            f"«во сколько», «в какой аудитории», {who_question}используй "
+            f"{schedule_view}: там уже есть lesson_date, starts_at, ends_at, "
+            f"lesson_type, subject_name, {who_column}group_name, building, "
             "room_number. Таблица schedule без дат — только для вопросов о "
             "недельной сетке.\n"
+            f"{no_teacher_note}"
             "   Текущую дату бери в часовом поясе Иркутска: "
             "(now() AT TIME ZONE 'Asia/Irkutsk')::date. «Завтра» — это "
             "+ INTERVAL '1 day' от неё. Пример: SELECT starts_at, "
-            "subject_name, room_number FROM schedule_calendar WHERE "
+            f"subject_name, room_number FROM {schedule_view} WHERE "
             "group_name = 'ФИТ-0925-1' AND lesson_date = "
             "(now() AT TIME ZONE 'Asia/Irkutsk')::date ORDER BY pair_number.\n"
             "   «Следующая пара» — ближайшее занятие ПОСЛЕ текущего момента. "
@@ -333,7 +460,7 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         )
 
     provenance_rule = ""
-    if "data_status" in schema:
+    if "data_sources" in allowed:
         provenance_rule = (
             "\n12. СЛУЖЕБНЫЕ КОЛОНКИ. Колонки data_status, source_url, "
             "source_id, checked_at и page_url в SELECT НЕ добавляй. Они нужны "
@@ -345,26 +472,43 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         )
 
     analytics_rule = ""
-    if "subject_performance" in schema or "room_availability" in schema:
+    if "subject_performance" in allowed or "room_availability" in allowed:
         analytics_rule = (
             "\n14. АНАЛИТИКА УЧЕБНОГО ПРОЦЕССА. Не собирай статистику из "
             "students, grades и enrollments — они закрыты. Для этого есть "
             "готовые представления, и в них уже посчитаны нужные величины:\n"
+            "   СЧИТАЯ ЛЮДЕЙ, БЕРИ ПРЕДСТАВЛЕНИЕ, ГДЕ СТРОКА — ЧЕЛОВЕК. "
+            "У каждого объекта в схеме выше есть подпись с его разрезом: "
+            "«строка = один студент», «строка = пара студент × кафедра» и так "
+            "далее. Сверяйся с ней перед COUNT и SUM. Складывать счётчик "
+            "долгов (debts_count) и выдавать сумму за число студентов нельзя: "
+            "это разные величины.\n"
             "   - успеваемость по дисциплине, распределение оценок, доля "
-            "сдавших с первой попытки -> subject_performance (колонки "
-            "excellent_count, good_count, satisfactory_count, failed_count, "
-            "first_attempt_pass_rate, retake_count, avg_score);\n"
+            "сдавших с первой попытки -> subject_summary (одна строка на "
+            "дисциплину: grades_count, avg_score, excellent_count, "
+            "good_count, satisfactory_count, failed_count, "
+            "first_attempt_pass_rate, retake_count). Разбивка того же по "
+            "направлениям и семестрам — subject_performance, но на вопрос "
+            "«какой процент сдал предмет» она даёт несколько разных чисел;\n"
+            "   - «сколько должников», «кто не сдал ни одного экзамена», «у "
+            "кого больше всего долгов» -> student_debts (строка = один "
+            "студент: debts_count, retakes_count, passed_count). Число "
+            "должников — это COUNT(*) WHERE debts_count > 0;\n"
+            "   - должники и нагрузка В РАЗРЕЗЕ КАФЕДРЫ -> department_debts "
+            "(строка = одна кафедра: students_total, debtors_count — сколько "
+            "ЧЕЛОВЕК, debts_total — сколько задолженностей, debtors_percent). "
+            "Кафедру ищи через search_vector;\n"
             "   - рейтинг студентов, средний балл конкретного человека -> "
             "student_rankings (last_name, first_name, group_name, "
             "faculty_name, semester, avg_score);\n"
-            "   - задолженности и пересдачи -> academic_debts (debts_count, "
-            "retakes_count, passed_count, department_name, group_name, "
-            "faculty_name, program_name — колонки semester здесь НЕТ). "
-            "КАФЕДРУ ищи ТОЛЬКО через search_vector: WHERE search_vector @@ "
-            "plainto_tsquery('russian', 'программная инженерия'). ILIKE по "
-            "department_name не сработает — в базе кафедра записана как "
-            "«Кафедра программной инженерии», и шаблон '%Программная "
-            "инженерия%' не совпадёт ни с чем;\n"
+            "   - поимённый разбор долгов ПО КАФЕДРАМ -> academic_debts "
+            "(строка — пара «студент × кафедра», поэтому COUNT(*) по ней "
+            "считает пары, а не людей; для людей есть student_debts и "
+            "department_debts выше). КАФЕДРУ ищи ТОЛЬКО через search_vector: "
+            "WHERE search_vector @@ plainto_tsquery('russian', 'программная "
+            "инженерия'). ILIKE по department_name не сработает — в базе "
+            "кафедра записана как «Кафедра программной инженерии», и шаблон "
+            "'%Программная инженерия%' не совпадёт ни с чем;\n"
             "   - кафедры: средний балл против общего -> "
             "department_performance (avg_score, university_avg_score, "
             "diff_from_university); нагрузка -> department_workload "
@@ -412,17 +556,47 @@ def build_sql_system_prompt(role: str | None = None) -> str:
             "путём из других таблиц."
         )
 
+    groups_rule = ""
+    if "groups_catalog" in allowed:
+        groups_rule = (
+            "\n15. ГРУППЫ И ИХ НАПРАВЛЕНИЯ. «Какие группы учатся на "
+            "направлении X», «на каком направлении группа Y», «сколько групп "
+            "на курсе» — только groups_catalog (group_name, course, "
+            "program_name, degree, study_form, faculty_name, students_count). "
+            "Направление ищи через search_vector: WHERE search_vector @@ "
+            "plainto_tsquery('russian', 'информационная безопасность').\n"
+            "   Учебные группы и официальный каталог направлений "
+            "(edu_programs, programs_admission) — РАЗНЫЕ вещи. Первое про "
+            "тех, кто уже учится, второе про приём. Соединять их запросом "
+            "нельзя: общих идентификаторов у них нет, и такой JOIN всегда "
+            "даёт пустой результат. Названия направлений в groups_catalog "
+            "лежат текстом — этого достаточно."
+        )
+
     faq_rule = ""
-    if "faq_entries" in schema:
+    if "faq_entries" in allowed:
         faq_rule = (
             "\n13. ОБЩИЕ ВОПРОСЫ. Если вопрос не ложится ни на одну таблицу "
             "данных («можно ли подать документы онлайн», «есть ли внутренние "
             "экзамены», «как связаться с вузом», «что с сессией и "
-            "библиотекой»), ищи в faq_entries: SELECT question, answer, "
-            "source_url, data_status FROM faq_entries WHERE question ILIKE "
+            "библиотекой»), ищи в faq_entries: SELECT question, answer "
+            "FROM faq_entries WHERE question ILIKE "
             "'%ключевое слово%' OR answer ILIKE '%ключевое слово%' OR "
             "keywords && ARRAY['ключевое слово']. Оператор && проверяет "
             "пересечение массивов и терпим к формулировке вопроса.\n"
+            "   FAQ — ЭТО ЗАПАСНОЙ ПУТЬ ДЛЯ ВОПРОСОВ ОБ УНИВЕРСИТЕТЕ, а не "
+            "универсальный ответ на всё. НЕ откатывайся сюда, когда:\n"
+            "     - просят персональные данные конкретного человека: паспорт, "
+            "телефон, почту, дату рождения студента, преподавателя или "
+            "абитуриента;\n"
+            "     - просят ИЗМЕНИТЬ данные — добавить, обновить, удалить "
+            "запись;\n"
+            "     - спрашивают про устройство самой базы: перечень таблиц, "
+            "колонки, служебные идентификаторы, учётные записи, пароли.\n"
+            "   Это не вопросы про университет, и ответа на них нет ни в "
+            "faq_entries, ни в любой другой таблице. Поиск по FAQ превращает "
+            "такой случай в пустой ответ, тогда как отказ должен быть виден: "
+            "ассистент работает только на чтение и только по учебным данным.\n"
             "   Сюда же откатывайся, если профильная таблица по теме вопроса "
             "оказалась пустой: в faq_entries лежит объяснение со ссылкой на "
             "официальный источник, и оно полезнее, чем «ничего не найдено». "
@@ -432,17 +606,33 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         )
 
     ege_rule = ""
-    if "ege_scores_summary" in schema:
+    if "ege_scores_summary" in allowed:
         ege_rule = (
             "\n7. Баллы ЕГЭ по отдельным предметам доступны через "
             "ege_scores_summary — там уже посчитаны avg_score, min_score, "
             "max_score и applications_count в разрезе subject, program_name, "
-            "degree, faculty_id и campaign_year. Приём тот же, что с "
+            "degree, faculty_name и campaign_year. Приём тот же, что с "
             "остальными представлениями: бери готовые агрегаты, а по "
             "нескольким строкам считай AVG(avg_score) или "
             "SUM(applications_count). Пример: SELECT subject, AVG(avg_score) "
             "FROM ege_scores_summary WHERE campaign_year = 2024 "
             "GROUP BY subject."
+        )
+
+    # Где искать группу по названию — зависит от роли: у гостя нет ни
+    # group_curriculum, ни schedule_calendar, и отправлять его туда значит
+    # гарантировать отказ проверки вместо ответа.
+    group_sources = [
+        name for name in ("groups_catalog", "group_curriculum",
+                          "schedule_calendar", "public_schedule")
+        if name in allowed
+    ]
+    group_lookup_rule = ""
+    if group_sources:
+        group_lookup_rule = (
+            f"   - «ФИТ-0925-1» и подобное — это ГРУППА: ищи по колонке "
+            f"group_name в {' или '.join(group_sources)}. В таблице groups "
+            f"колонка называется просто name, а не group_name.\n"
         )
 
     return (
@@ -454,8 +644,14 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         f"таблицу саму с собой без явной необходимости.\n"
         f"{relationships}\n\n"
         f"ПРАВИЛА:\n"
-        f"1. Генерируй ТОЛЬКО SELECT-запросы (или WITH ... SELECT).\n"
-        f"2. Не используй таблицы вне схемы и не-modify данные.\n"
+        f"1. Генерируй ТОЛЬКО SELECT-запросы (или WITH ... SELECT). Изменять "
+        f"данные ассистент не может: на «добавь», «обнови», «удали» не "
+        f"подбирай обходной путь и не ищи ответ в справочных таблицах.\n"
+        f"2. Только таблицы из списка выше. Служебного устройства базы — "
+        f"перечня таблиц, описания колонок, внутренних идентификаторов, "
+        f"учётных записей и паролей — в этом списке нет и не будет. Это не "
+        f"данные университета, отвечать на такие вопросы нечем: не подставляй "
+        f"похожую таблицу и не откатывайся в faq_entries.\n"
         f"3. Если нужно много строк — добавь LIMIT (например, LIMIT 50).\n"
         f"4. В ответе выдай ЕДИНСТВЕННУЮ вещь — SQL в блоке ```sql ... ```. "
         f"Никакого пояснительного текста до и после. Никакого другого текста.\n"
@@ -500,9 +696,7 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         f"SELECT program_name, level, study_form, unit_name, exams_required, "
         f"budget_seats, tuition_rub FROM programs_admission WHERE "
         f"search_vector @@ plainto_tsquery('russian', 'психология');\n"
-        f"   - «ФИТ-0925-1» и подобное — это ГРУППА: ищи по колонке "
-        f"group_name в schedule_calendar или group_curriculum. В таблице "
-        f"groups колонка называется просто name, а не group_name.\n"
+        f"{group_lookup_rule}"
         f"   Не отказывайся и не переспрашивай — покажи, что нашлось."
         f"{ege_rule}"
         f"{personal_rule}"
@@ -512,7 +706,112 @@ def build_sql_system_prompt(role: str | None = None) -> str:
         f"{provenance_rule}"
         f"{analytics_rule}"
         f"{faq_rule}"
+        f"{groups_rule}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Защита от ответа-бланка
+# ---------------------------------------------------------------------------
+#
+# Наблюдалось на стенде. Вопрос «какие группы учатся на направлении
+# информационная безопасность», выборка вернула пусто, и вторая фаза выдала:
+#
+#   «На направлении «Информационная безопасность» учатся следующие группы:
+#    [название группы 1]
+#    [название группы 2]»
+#
+# а в следующий раз — вместе с собственными рассуждениями модели:
+#
+#   «(перечислить группы, если бы они были в ответе). Если данных нет, то: …»
+#
+# Это худший исход из возможных: выглядит как ответ, читается как ответ и
+# ответом не является. Правило 2 интерпретирующего промпта прямо это запрещает
+# (см. build_interpret_system_prompt) — и, как видно, не всегда срабатывает.
+# Промпт остаётся, но опираться теперь есть на что: текст проверяется кодом.
+#
+# Регулярка заглушек взята из backend/tests/eval_live_questions.py, где она
+# ловила ровно этот исход под именем «шаблон». Теперь она здесь, и тест берёт
+# её отсюда: проверка и рабочий код должны считать бланком одно и то же.
+PLACEHOLDER_RE = re.compile(r"\[[^\]\n]{2,40}\]|\{[а-яa-z_ ]{2,40}\}", re.I)
+
+# Утёкшие наружу ветвления: модель отдала черновик вместо ответа.
+LEAKED_BRANCHING_RE = re.compile(
+    r"если\s+данных\s+нет"
+    r"|если\s+бы\s+(?:они|он|она)\s+был"
+    r"|\(\s*перечислить"
+    r"|если\s+результат\s+пуст",
+    re.I,
+)
+
+# Что отдаём вместо бланка. Честный отказ полезнее правдоподобной выдумки.
+NOTHING_FOUND_ANSWER = (
+    "По этому вопросу в базе ничего не нашлось. Возможно, таких данных нет "
+    "или формулировку стоит уточнить — назовите направление, группу, "
+    "дисциплину или год."
+)
+
+# Отдельный ответ для случая «вопрос вообще не про наши данные».
+#
+# Наблюдалось на просьбах «покажи список таблиц базы данных и их пароли» и
+# «добавь нового студента Иванова». Модель не пыталась дотянуться до закрытых
+# таблиц — она уходила в faq_entries по ключевому слову («%пароли%») и
+# возвращала пусто. Утечки тут нет и быть не может, но и ответа нет: человек
+# получал «ничего не нашлось» вместо «так нельзя».
+#
+# Промптом это не лечится — проверено тремя редакциями правил, включая перенос
+# запрета в начало списка. Поэтому решается кодом: если отвечали ТОЛЬКО поиском
+# по справке и не нашли ничего, значит вопрос за пределами области ассистента,
+# и сказать надо именно это.
+OUT_OF_SCOPE_ANSWER = (
+    "В справочной информации такого нет. Ассистент отвечает по учебной части, "
+    "расписанию, успеваемости и приёму — и только на чтение: устройство самой "
+    "базы, учётные записи и изменение записей ему недоступны."
+)
+
+# Гостю из публичного виджета доступно меньше, и перечислять ему успеваемость
+# значит обещать то, чего он не получит.
+GUEST_OUT_OF_SCOPE_ANSWER = (
+    "Такого здесь нет. Помощник отвечает по поступлению — направления, "
+    "вступительные испытания, сроки, места и стоимость, — а также по "
+    "расписанию занятий, корпусам и аудиториям. Сведений о конкретных людях, "
+    "студентах и преподавателях, у него нет."
+)
+
+
+def is_out_of_scope(executed_sql: str | None) -> bool:
+    """Отвечали ТОЛЬКО поиском по справке — значит вопрос не про наши данные.
+
+    Развилка живёт здесь, чтобы /chat и eval_live_questions.py судили об одном
+    и том же одинаково.
+    """
+    return bool(executed_sql) and security.tables_in(executed_sql) == {"faq_entries"}
+
+
+def out_of_scope_answer(role: str | None = None) -> str:
+    return GUEST_OUT_OF_SCOPE_ANSWER if role == "guest" else OUT_OF_SCOPE_ANSWER
+
+
+def empty_result_answer(executed_sql: str | None, role: str | None = None) -> str:
+    """Что отвечать на пустую выборку."""
+    if is_out_of_scope(executed_sql):
+        return out_of_scope_answer(role)
+    return NOTHING_FOUND_ANSWER
+
+
+def blank_answer_reason(answer: str) -> str | None:
+    """Причина, по которой ответ считается бланком, либо None.
+
+    Возвращается строка для audit_log — чтобы подмена была видна в аудите,
+    а не происходила молча.
+    """
+    match = PLACEHOLDER_RE.search(answer)
+    if match:
+        return f"заглушка вместо данных: {match.group(0)[:60]}"
+    match = LEAKED_BRANCHING_RE.search(answer)
+    if match:
+        return f"утёкшее рассуждение модели: {match.group(0)[:60]}"
+    return None
 
 
 def build_correction_input(question: str, sql: str, error: str) -> str:

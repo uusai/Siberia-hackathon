@@ -189,6 +189,37 @@ def test_minimum_and_passing_scores_are_separate_tables():
 # Расписание
 # ---------------------------------------------------------------------
 
+def test_public_schedule_carries_no_person():
+    """В публичном расписании физически нет полей о людях.
+
+    public_schedule отдаётся роли `guest`, токен которой выдаётся БЕЗ ПАРОЛЯ
+    любому посетителю сайта через встраиваемый виджет. Защита здесь не в том,
+    что модель попросили не выбирать ФИО, а в том, что такой колонки НЕТ:
+    запрос `SELECT teacher_name FROM public_schedule` не отклоняется
+    проверкой — он падает в СУБД, потому что выбирать нечего.
+
+    Если кто-то добавит колонку обратно, тест сломается раньше, чем виджет
+    попадёт на сайт вуза.
+    """
+    tables = _existing_tables()
+    if "public_schedule" not in tables:
+        return
+    columns = {
+        c for (c,) in q(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'assistant' AND table_name = 'public_schedule'"
+        )
+    }
+    for forbidden in ("teacher_name", "teacher_id", "full_name", "last_name",
+                      "first_name", "email", "phone"):
+        assert forbidden not in columns, (
+            f"public_schedule не должен содержать {forbidden}: "
+            f"он доступен анонимному посетителю сайта"
+        )
+    # И то, ради чего представление существует, на месте.
+    assert {"lesson_date", "subject_name", "group_name", "room_number"} <= columns
+
+
 def test_no_schedule_conflicts():
     """Группа, преподаватель и аудитория не могут быть в двух местах сразу."""
     tables = _existing_tables()

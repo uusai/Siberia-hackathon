@@ -21,6 +21,19 @@ services:
     networks:
       - hackathon_net
 
+  # Встраиваемый виджет для сайта вуза. Отдельный сервис и отдельный порт:
+  # его подключают с ЧУЖИХ доменов, тогда как frontend — интерфейс
+  # сотрудников. Разные контуры потребителей, значит разные точки входа.
+  widget:
+    build: ./widget
+    container_name: hackathon_widget
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    networks:
+      - hackathon_net
+
 networks:
   hackathon_net:
     driver: bridge
