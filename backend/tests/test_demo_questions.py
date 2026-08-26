@@ -84,13 +84,17 @@ ANSWERABLE = [
      "WHERE search_vector @@ plainto_tsquery('russian', 'дефектологическое')"),
 
     ("Топ-5 студентов факультета IT со средним баллом", "deans-office",
-     "SELECT last_name, first_name, group_name, avg_score FROM student_rankings "
+     "SELECT group_name, program_name, semester, avg_score FROM student_rankings "
      "WHERE faculty_name ILIKE '%информацион%' ORDER BY avg_score DESC LIMIT 5"),
 
-    ("У какого студента группы больше всего задолженностей", "deans-office",
-     "SELECT last_name, first_name, sum(debts_count) AS debts FROM academic_debts "
-     "WHERE group_name = 'ФИТ-0925-1' GROUP BY last_name, first_name "
-     "ORDER BY debts DESC LIMIT 3"),
+    # Вопрос был «у какого СТУДЕНТА больше всего задолженностей» и отвечался
+    # поимённо. После миграции 020 имена обучающихся не выдаются вовсе —
+    # памятка запрещает любые данные, позволяющие их идентифицировать.
+    # Ответ теперь обезличенный: сколько должников и долгов в группе.
+    ("Сколько должников в группе", "deans-office",
+     "SELECT group_name, count(*) FILTER (WHERE debts_count > 0) AS debtors, "
+     "sum(debts_count) AS debts FROM student_debts "
+     "WHERE group_name = 'ФИТ-0925-1' GROUP BY group_name"),
 
     # ВНИМАНИЕ на историю этого кейса. Здесь стояло
     #   SELECT count(*) FROM academic_debts WHERE ... AND debts_count > 0
@@ -158,14 +162,14 @@ ANSWERABLE = [
      "WHERE avg_hours_per_teacher > 250 ORDER BY avg_hours_per_teacher DESC"),
 
     # Пустой ответ здесь — законный: «таких студентов нет» это тоже ответ.
-    ("Кто не сдал ни одного экзамена", "deans-office",
-     "SELECT last_name, first_name, group_name FROM student_rankings "
-     "GROUP BY last_name, first_name, group_name HAVING max(avg_score) < 3 LIMIT 10",
+    ("Сколько студентов не сдали ни одного экзамена", "deans-office",
+     "SELECT group_name, program_name, count(*) FROM student_debts "
+     "WHERE passed_count = 0 GROUP BY group_name, program_name LIMIT 10",
      True),
 
-    ("Студенты с несданными экзаменами", "deans-office",
-     "SELECT last_name, first_name, group_name, sum(debts_count) AS debts "
-     "FROM academic_debts GROUP BY last_name, first_name, group_name "
+    ("Группы с наибольшим числом задолженностей", "deans-office",
+     "SELECT group_name, program_name, sum(debts_count) AS debts "
+     "FROM student_debts GROUP BY group_name, program_name "
      "HAVING sum(debts_count) > 5 ORDER BY debts DESC LIMIT 10"),
 
     ("Список преподавателей и их нагрузка", "student",
