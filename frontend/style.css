@@ -316,6 +316,19 @@ body[data-screen="chat"] .topbar {
   color: var(--paper-70);
 }
 
+/* Роль рядом с логином. Единственная «пилюля» в шапке — форма намеренно
+   повторяет .badge в ленте: и там, и там это пометка, а не действие. */
+.topbar__role {
+  padding: 3px 10px;
+  border: 1px solid var(--paper-20);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-micro);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--paper-50);
+  white-space: nowrap;
+}
+
 .topbar__status {
   display: inline-flex; align-items: center; gap: var(--spacing-8);
   font-size: var(--text-micro);
@@ -498,12 +511,42 @@ body[data-screen="chat"] .topbar {
 
 .msg__who {
   margin: 0;
+  display: flex; align-items: baseline; gap: var(--spacing-12);
   font-size: var(--text-micro);
   letter-spacing: .14em;
   text-transform: uppercase;
   color: var(--paper-40);
 }
 .msg--user .msg__who { color: var(--paper-50); }
+
+.msg__author { flex: none; }
+
+/* Время реплики: тише автора, чтобы не спорить с ним за внимание */
+.msg__time {
+  color: var(--paper-20);
+  letter-spacing: .08em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Действия под ответом: «скопировать», «повторить». Текстовые, без рамок —
+   в системе кнопка-пилюля зарезервирована за первичными действиями. */
+.msg__action {
+  align-self: flex-start;
+  margin-top: var(--spacing-12);
+  border: 0; background: transparent; padding: 0;
+  font-family: inherit;
+  font-size: var(--text-micro);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--paper-40);
+  cursor: pointer;
+  transition: color var(--dur-micro) var(--ease-glide);
+}
+.msg__action:hover  { color: var(--color-paper); }
+.msg__action:focus-visible {
+  outline: 1px solid var(--paper-30);
+  outline-offset: 3px;
+}
 
 .msg__text {
   margin: 0;
@@ -642,6 +685,36 @@ body[data-screen="chat"] .topbar {
 }
 .result-meta__csv:hover { color: var(--color-paper); }
 
+/* — ссылка на источник над таблицей —
+   Длинный URL из выборки не помещается в ячейку и разносит таблицу вширь,
+   поэтому он выносится сюда и сокращается до имени файла или домена. */
+.provenance {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: var(--spacing-8) var(--spacing-12);
+  margin: 0 0 var(--spacing-12);
+}
+
+.provenance__note { font-size: var(--text-micro); color: var(--paper-30); }
+
+/* Ссылка на источник: подчёркивание вместо цвета — цвет в системе занят
+   иридесценцией и в интерфейсных элементах не используется. */
+.src-link {
+  font-size: var(--text-micro);
+  letter-spacing: .08em;
+  color: var(--paper-50);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--paper-20);
+  transition: color var(--dur-micro) var(--ease-glide),
+              text-decoration-color var(--dur-micro) var(--ease-glide);
+}
+.src-link:hover {
+  color: var(--color-paper);
+  text-decoration-color: var(--paper-40);
+}
+
+.result-table td.is-link { white-space: nowrap; }
+
 /* — предупреждение об усечении выборки — */
 .notice {
   margin-top: var(--spacing-12);
@@ -734,6 +807,10 @@ body[data-screen="chat"] .topbar {
   .topbar__session { gap: var(--spacing-12); }
   .topbar__status { display: none; }        /* точка статуса уступает место кнопке */
   .wordmark__text { display: none; }
+  /* Логин на узком экране уступает роли: какие данные доступны — важнее,
+     чем под каким именем вошли, имя всё равно видно на экране входа. */
+  .topbar__user { display: none; }
+  .topbar__role { padding: 2px 8px; letter-spacing: .08em; }
 
   .msg__text { font-size: var(--text-body-sm); }
   .pill-btn { padding: 10px 24px; font-size: 15px; }

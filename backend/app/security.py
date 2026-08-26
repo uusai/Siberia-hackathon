@@ -44,10 +44,96 @@ _load_dotenv()
 # ege_scores_summary — тот же приём, что со students_summary.
 
 # Справочники и расписание: ничего личного, доступны любой роли.
+#
+# ЧЕГО ЗДЕСЬ НАМЕРЕННО НЕТ: faculties, programs и departments.
+#
+# Это таблицы демонстрационного контура: пять выдуманных факультетов вроде
+# «Факультета информационных технологий» и тринадцать направлений при них. На
+# них завязаны студенты, группы и расписание, поэтому таблицы остаются в базе
+# и работают — но модели они не показываются.
+#
+# Причина конкретная: на вопрос «сколько факультетов в ИГУ» модель уверенно
+# отвечала «пять», взяв ответ из faculties, тогда как приём в 2026 году ведут
+# 15 подразделений (assistant.university_units). Пока обе таблицы видны, выбор
+# между ними — лотерея, а проигрыш выглядит как уверенно названная неправда о
+# самом университете.
+#
+# Ничего не теряется: название факультета, направления и кафедры есть текстом
+# в аналитических представлениях (faculty_name, program_name,
+# department_name), а официальный каталог — в university_units и edu_programs.
 _BASE_TABLES = {
-    "faculties", "departments", "programs", "subjects", "teachers",
-    "rooms", "groups", "schedule", "admission_campaigns",
+    "subjects", "teachers", "rooms", "groups", "schedule",
+    "admission_campaigns",
 }
+
+# Официальный справочник ИГУ (миграции 006/008) и надстройка расписания с
+# датами (007). Всё это — публично опубликованные сведения: структура вуза,
+# перечни вступительных испытаний, минимальные баллы, сроки приёма, стоимость
+# обучения, адреса и телефоны приёмной комиссии. Ограничивать их по ролям
+# незачем: абитуриент, который спрашивает «что сдавать на юриспруденцию»,
+# заходит под той же учёткой, что и студент.
+#
+# ПРО КОЛОНКИ КОНТАКТОВ. В contacts, dormitories и university_units телефон и
+# почта называются contact_phone и contact_email, а не phone и email. Это не
+# косметика: _assert_no_forbidden_columns() ниже ищет FORBIDDEN_COLUMNS во
+# ВСЁМ тексте запроса, разбивая его на токены [a-zA-Z_]+. Колонка с именем
+# phone сделала бы вопрос «телефон приёмной комиссии» неотвечаемым — запрос
+# отклонялся бы проверкой. Токены contact_phone и contact_email в чёрный
+# список не входят, а сам список не ослабляется: он по-прежнему закрывает
+# паспорт, телефон, почту и дату рождения студентов и абитуриентов.
+_OFFICIAL_REFERENCE_TABLES = {
+    # справочник и его источники
+    "data_sources", "university_units", "edu_programs",
+    # приёмная кампания
+    "entrance_exams", "program_exams", "minimum_scores", "passing_scores",
+    "enrollment_places", "tuition_fees", "admission_deadlines",
+    "admission_documents", "benefits_quotas",
+    # инфраструктура и справочная информация
+    "dormitories", "campus_buildings", "contacts", "faq_entries",
+    # денормализованные представления — именно ими и должна пользоваться
+    # модель вместо самостоятельной сборки JOIN'ов
+    "programs_admission", "program_exam_sets", "minimum_scores_view",
+    "passing_scores_view", "data_status_summary",
+    # расписание с датами и временем
+    "pair_times", "academic_terms", "lesson_occurrences", "schedule_calendar",
+}
+
+# Качество расписания — рабочий инструмент деканата, а не ответ студенту.
+# Студенту незачем знать, что в его расписании нашлось пересечение: ему нужно
+# расписание. Деканату — наоборот.
+_SCHEDULE_QUALITY_TABLES = {
+    "schedule_conflicts_group", "schedule_conflicts_teacher",
+    "schedule_conflicts_room", "schedule_issues",
+}
+
+# Аналитика учебного процесса (миграция 009). Разложена по ролям по одному
+# признаку: видно ли из представления КОНКРЕТНОГО ЧЕЛОВЕКА.
+
+# Ничего личного: аудитории, учебные планы, количество мест. Любая роль.
+_ANALYTICS_PUBLIC = {
+    "room_load", "room_availability", "group_curriculum", "seats_ratio",
+}
+
+# Обезличенная успеваемость по дисциплинам: распределение оценок, доля
+# сдавших с первой попытки. Ни ФИО, ни идентификаторов студентов — поэтому
+# доступно преподавателю, которому надо понимать, как идёт его предмет.
+_ANALYTICS_TEACHING = {"subject_performance"}
+
+# ПОИМЁННАЯ успеваемость и нагрузка. Только деканат и администрация.
+#
+# student_rankings и academic_debts показывают ФИО студентов — это осознанное
+# расширение прав деканата, который по должности работает с успеваемостью
+# поимённо. Паспорта, телефона, почты и даты рождения в них нет: эти поля
+# остались в FORBIDDEN_COLUMNS и в самих представлениях отсутствуют.
+# Студенту и преподавателю эти объекты не выдаются.
+_ANALYTICS_DEANS = {
+    "student_rankings", "academic_debts", "department_performance",
+    "department_workload", "teacher_semester_load", "funding_share",
+}
+
+# Приёмная кампания в разрезе дней и годов. Обезличено, но это внутренняя
+# статистика вуза, поэтому только администрации — как и applications_summary.
+_ANALYTICS_ADMIN = {"applications_by_day", "admission_dynamics"}
 
 # Личные вьюхи студента. Они сами фильтруются по app.student_id, который
 # бэкенд выставляет из проверенного токена (см. sql/003_role_access.sql):
@@ -63,15 +149,21 @@ TEACHER_PERSONAL_TABLES = {
 }
 
 # Доступ накопительный: каждая следующая роль видит всё, что предыдущая.
+# Официальный справочник доступен всем — это опубликованные сведения.
 ALLOWED_TABLES_BY_ROLE: dict[str, set[str]] = {
-    "student": _BASE_TABLES | STUDENT_PERSONAL_TABLES,
-    "teacher": _BASE_TABLES | TEACHER_PERSONAL_TABLES | {
+    "student": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
+    | STUDENT_PERSONAL_TABLES,
+    "teacher": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
+    | _ANALYTICS_TEACHING | TEACHER_PERSONAL_TABLES | {
         "curriculum", "grades_summary",
     },
-    "deans-office": _BASE_TABLES | {
+    "deans-office": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
+    | _ANALYTICS_TEACHING | _ANALYTICS_DEANS | _SCHEDULE_QUALITY_TABLES | {
         "curriculum", "grades_summary", "students_summary",
     },
-    "administration": _BASE_TABLES | {
+    "administration": _BASE_TABLES | _OFFICIAL_REFERENCE_TABLES | _ANALYTICS_PUBLIC
+    | _ANALYTICS_TEACHING | _ANALYTICS_DEANS | _ANALYTICS_ADMIN
+    | _SCHEDULE_QUALITY_TABLES | {
         "curriculum", "grades_summary", "students_summary",
         "applications_summary", "ege_scores_summary",
     },
@@ -149,6 +241,19 @@ def _assert_select_only(sql: str) -> None:
             f"Запрещённая функция: {', '.join(sorted(banned))}."
         )
 
+    # Неподставленный шаблон вида {user_input}. Появляется, когда просят
+    # «подставь мой текст в WHERE как есть»: модель послушно оставляет
+    # заготовку. До БД такое доезжать не должно — там оно превращается в
+    # синтаксическую ошибку, а пользователю показывается невнятный отказ
+    # сервера вместо понятного объяснения.
+    placeholder = re.search(r"\{[^{}]*\}", sql)
+    if placeholder:
+        raise SQLSecurityError(
+            f"В запросе осталась неподставленная заготовка "
+            f"'{placeholder.group(0)}'. Подстановка произвольного текста в "
+            f"запрос не выполняется."
+        )
+
 
 # Токен: идентификатор (возможно составной через точку и/или в двойных
 # кавычках), скобка, запятая либо любой другой непробельный кусок.
@@ -165,6 +270,18 @@ _TABLE_LIST_TERMINATORS = {
     "intersect", "except", "on", "using", "join", "inner", "left",
     "right", "full", "cross", "natural", "window", "fetch", "select",
     "with", "and", "or",
+}
+
+
+# Функции, у которых FROM — часть СОБСТВЕННОГО синтаксиса, а не начало
+# перечисления таблиц: EXTRACT(YEAR FROM now()), SUBSTRING(s FROM 2 FOR 3),
+# TRIM(BOTH ' ' FROM s), POSITION(a IN b), OVERLAY(s PLACING x FROM 2).
+#
+# Без этого списка проверка видела «FROM now()» и требовала таблицу с именем
+# NOW — то есть отклоняла совершенно нормальный запрос «за последние 5 лет».
+# Ловилось это только вживую: рукописный SQL в тестах EXTRACT не использовал.
+_FROM_INSIDE_FUNCTIONS = {
+    "extract", "substring", "trim", "overlay", "position",
 }
 
 
@@ -192,8 +309,39 @@ def _extract_table_refs(sql: str) -> list[str]:
 
     refs: list[str] = []
     state = "normal"
+    # Глубина вложенности внутри EXTRACT/SUBSTRING/TRIM и подобных: пока она
+    # больше нуля, слово FROM к таблицам отношения не имеет.
+    skip_from_until_depth: list[int] = []
+    depth = 0
+    previous = ""
+
     for token in _SQL_TOKEN_RE.findall(sanitized):
         lowered = token.lower()
+
+        if token == "(":
+            depth += 1
+            if previous in _FROM_INSIDE_FUNCTIONS:
+                skip_from_until_depth.append(depth)
+            previous = token
+            # Скобка сразу после FROM — производная таблица или подзапрос:
+            # её собственный FROM разберётся отдельно, здесь имени нет.
+            if state in ("expect_table", "after_table"):
+                state = "normal"
+            continue
+        if token == ")":
+            if skip_from_until_depth and skip_from_until_depth[-1] == depth:
+                skip_from_until_depth.pop()
+            depth -= 1
+            previous = token
+            # Закрывающая скобка сама по себе может завершать перечисление
+            # таблиц — прежнее поведение сохраняем.
+            if state in ("expect_table", "after_table"):
+                state = "normal"
+            continue
+        previous = lowered
+
+        if skip_from_until_depth and lowered in ("from", "join"):
+            continue
 
         if state == "expect_table":
             if token == "(":
@@ -300,6 +448,47 @@ def validate_sql(sql: str, role: str | None = None) -> str:
     return _ensure_limit(normalized)
 
 
+def explain_rejection(error: SQLSecurityError | str) -> str:
+    """Переводит отказ проверки на человеческий язык.
+
+    Тексты самих исключений писались для разработчика и в лог аудита идут как
+    есть — там нужна точность. Пользователю же «Не удалось определить таблицу
+    в запросе» в ответ на «обнови мою оценку на 5» не объясняет ничего: он
+    спрашивал не про таблицы. Причина отказа при этом совершенно понятная —
+    ассистент не меняет данные, — и сказать её надо словами.
+    """
+    text = str(error)
+    lowered = text.lower()
+
+    if "только select" in lowered or "запрещённая конструкция" in lowered:
+        return ("Ассистент работает только на чтение: добавлять, изменять и "
+                "удалять данные через него нельзя.")
+    if "недоступны вашей роли" in lowered:
+        return (f"{text} Если данные нужны по работе, доступ выдаёт "
+                f"администратор системы.")
+    if "не входит в список разрешённых" in lowered or "схемы запрещены" in lowered:
+        return ("Таких данных у ассистента нет. Он отвечает по учебной части, "
+                "расписанию и приёму — служебные таблицы базы закрыты.")
+    if "не удалось определить таблицу" in lowered:
+        # Сюда попадают два разных случая: вопрос не про данные вообще и
+        # просьба что-то изменить, на которую модель выдала запрос без FROM.
+        # Различить их здесь нечем, поэтому отвечаем на оба сразу.
+        return ("Не понял, какие именно данные нужны. Если вы просили что-то "
+                "изменить или удалить — ассистент работает только на чтение. "
+                "Иначе переформулируйте вопрос: назовите направление, группу "
+                "или дисциплину.")
+    if "заготовка" in lowered:
+        return ("Подставлять произвольный текст прямо в запрос нельзя. "
+                "Спросите обычными словами — ассистент составит запрос сам.")
+    if "один sql-оператор" in lowered:
+        return ("В одном вопросе — один запрос. Несколько команд подряд "
+                "ассистент не выполняет.")
+    if "персональных данных" in lowered or "personal-data" in lowered:
+        return ("Персональные данные — паспорт, телефон, почта, дата "
+                "рождения — закрыты для всех ролей.")
+    return text
+
+
 def _format_value(value) -> str:
     """Приводит значение к тому же виду, что раньше печатал psql -t -A.
 
@@ -312,6 +501,13 @@ def _format_value(value) -> str:
         return "t"
     if value is False:
         return "f"
+    if isinstance(value, list):
+        # Массивы (required_subjects и подобные) str() отдаёт питоновским
+        # repr: ['Математика (профильный уровень)', 'Русский язык']. Это
+        # доезжает и до модели, и до таблицы во фронтенде — квадратные скобки
+        # с кавычками там лишние, а ведущая «[» ещё и похожа на признак
+        # ошибки, которым помечаются служебные сообщения.
+        return ", ".join("" if v is None else str(v) for v in value)
     return str(value)
 
 

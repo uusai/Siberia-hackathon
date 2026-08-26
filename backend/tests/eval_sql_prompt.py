@@ -44,11 +44,101 @@ CASES = [
      "SELECT count(*) FROM teachers"),
     ("сколько аудиторий типа лаборатория",
      "SELECT count(*) FROM rooms WHERE room_type = 'лаборатория'"),
-    ("сколько программ магистратуры",
-     "SELECT count(*) FROM programs WHERE degree = 'магистратура'"),
-    ("сколько программ заочной формы обучения",
-     "SELECT count(*) FROM programs WHERE study_form = 'заочная'"),
+    ("сколько направлений бакалавриата в университете",
+     "SELECT count(*) FROM edu_programs WHERE level = 'бакалавриат'"),
+    ("сколько направлений очной формы обучения",
+     "SELECT count(*) FROM edu_programs WHERE study_form = 'очная'"),
+    ("сколько факультетов и институтов в ИГУ",
+     "SELECT count(*) FROM university_units"),
 ]
+
+
+# Вопросы абитуриента и студента из технического задания. Здесь сверяется НЕ
+# значение, а маршрутизация: попала ли модель в нужную таблицу. Для «какие
+# факультеты есть в ИГУ» правильных ответов много и все они списки — сравнивать
+# первую ячейку с эталоном бессмысленно, а вот обращение к university_units
+# вместо демонстрационной faculties проверяется однозначно.
+#
+# Набор намеренно включает опечатки, сокращения, падежи и разговорные
+# формулировки: промпт должен переживать то, как люди пишут на самом деле.
+ROUTING_CASES = [
+    # --- абитуриент: структура и направления
+    ("какие факультеты есть в ИГУ", {"university_units"}),
+    ("какие институты в игу", {"university_units"}),
+    ("какие специальности есть в институте математики",
+     {"programs_admission", "edu_programs", "university_units"}),
+    ("какие направления подготовки доступны", {"programs_admission", "edu_programs"}),
+    # --- абитуриент: испытания и баллы
+    ("что сдавать на программирование", {"programs_admission", "program_exam_sets"}),
+    ("какие экзамены нужны на юриспруденцию",
+     {"programs_admission", "program_exam_sets"}),
+    ("какой минимальный балл по русскому языку", {"minimum_scores_view"}),
+    ("какой был проходной балл на биологию в прошлом году", {"passing_scores_view"}),
+    ("чем минимальный балл отличается от проходного",
+     {"faq_entries", "minimum_scores_view", "passing_scores_view"}),
+    ("я сдаю русский математику и информатику куда могу поступить",
+     {"program_exam_sets"}),
+    ("у меня 240 баллов хватит ли на бюджет",
+     {"passing_scores_view", "minimum_scores_view"}),
+    ("есть ли внутренние вступительные экзамены",
+     {"entrance_exams", "program_exams", "faq_entries"}),
+    # --- абитуриент: места, деньги, сроки
+    ("сколько бюджетных мест", {"programs_admission", "enrollment_places"}),
+    ("сколько стоит обучение", {"programs_admission", "tuition_fees"}),
+    ("до какого числа подавать документы", {"admission_deadlines"}),
+    ("когда заканчивается приём на бюджет", {"admission_deadlines"}),
+    ("когда завершается приём оригиналов", {"admission_deadlines"}),
+    ("какие документы нужны для поступления", {"admission_documents"}),
+    ("можно ли подать документы онлайн", {"faq_entries"}),
+    # --- абитуриент: быт и льготы
+    ("есть ли общежитие", {"dormitories"}),
+    ("кому дают общагу", {"dormitories"}),
+    ("есть ли целевое обучение и льготы", {"benefits_quotas"}),
+    ("как связаться с приемной комиссией", {"contacts"}),
+    ("где находится приёмная комиссия", {"contacts", "campus_buildings"}),
+    # --- студент: расписание
+    ("какое у меня расписание сегодня", {"my_schedule", "schedule_calendar"}),
+    ("что завтра по расписанию у группы ФИТ-0925-1", {"schedule_calendar"}),
+    ("какая следующая пара", {"schedule_calendar", "my_schedule"}),
+    ("в какой аудитории занятие", {"schedule_calendar", "my_schedule"}),
+    ("во сколько начинается вторая пара", {"pair_times", "schedule_calendar"}),
+    ("кто ведёт предмет", {"schedule_calendar", "my_schedule", "curriculum"}),
+    ("расписание на 15 сентября", {"schedule_calendar"}),
+]
+
+
+def _tables_in(sql: str) -> set[str]:
+    return {t.lower() for t in security._extract_table_refs(sql)}
+
+
+def run_routing(prompt: str, repeats: int) -> tuple[int, int, list]:
+    """Проверяет, в какую таблицу модель направляет вопрос."""
+    total = passed = 0
+    misses = []
+    print("\nМАРШРУТИЗАЦИЯ ВОПРОСОВ (в какую таблицу пошла модель)\n")
+    for question, expected in ROUTING_CASES:
+        marks = []
+        for _ in range(repeats):
+            total += 1
+            reply = ai_agent.call_gpt(prompt, question)
+            sql = ai_agent.extract_sql(reply)
+            if not sql:
+                marks.append("нет SQL")
+                misses.append((question, "модель не вернула SQL", reply[:90]))
+                continue
+            used = _tables_in(sql)
+            if used & expected:
+                passed += 1
+                marks.append("ok")
+            else:
+                marks.append(",".join(sorted(used)) or "?")
+                misses.append((
+                    question,
+                    f"ожидались {sorted(expected)}, использованы {sorted(used)}",
+                    " ".join(sql.split())[:90],
+                ))
+        print(f"  [{'/'.join(marks):<26}] {question}")
+    return passed, total, misses
 
 
 def _first_cell(result: str) -> str:
@@ -100,15 +190,25 @@ def main(repeats: int = 2) -> int:
 
         print(f"  [{'/'.join(marks):<26}] эталон={expected:<6} {question}")
 
-    print(f"\nИТОГО: {passed}/{total} = {100 * passed / total:.0f}%")
+    print(f"\nЗНАЧЕНИЯ: {passed}/{total} = {100 * passed / total:.0f}%")
     if failures:
         print("\nразбор полётов:")
         for q, why, extra in failures[:14]:
             print(f"  - {q}\n      {why}\n      {extra}")
+
+    if "--no-routing" not in sys.argv:
+        r_passed, r_total, misses = run_routing(prompt, repeats)
+        print(f"\nМАРШРУТИЗАЦИЯ: {r_passed}/{r_total} = "
+              f"{100 * r_passed / r_total:.0f}%")
+        if misses:
+            print("\nпромахи маршрутизации:")
+            for q, why, extra in misses[:14]:
+                print(f"  - {q}\n      {why}\n      {extra}")
 
     db.close_all()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(int(sys.argv[1]) if len(sys.argv) > 1 else 2))
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    sys.exit(main(int(args[0]) if args else 2))

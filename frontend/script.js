@@ -27,11 +27,35 @@
 
 /* ═══ 1. КОНФИГУРАЦИЯ ═════════════════════════════════════════════════ */
 
-const API_URL    = 'http://localhost:8000/chat';
-const API_BASE   = API_URL.replace(/\/chat\/?$/, '');
+/* Адрес бэкенда выводится из адреса страницы, а не зашит в localhost.
+ *
+ * Раньше здесь стояло http://localhost:8000, и это работало ровно до первой
+ * попытки открыть демо с другого устройства: фронтенд отдаётся с сервера, а
+ * запросы уходили на localhost зрителя. Docker-раскладка кладёт фронтенд на
+ * порт 80, бэкенд — на 8000 того же хоста, поэтому хост берём из страницы.
+ *
+ * Явное переопределение: window.ASSISTANT_API = 'http://host:port' до
+ * загрузки скрипта — нужно, если бэкенд вынесен на другую машину.
+ */
+const API_BASE = (() => {
+  if (typeof window !== 'undefined' && window.ASSISTANT_API) {
+    return String(window.ASSISTANT_API).replace(/\/+$/, '');
+  }
+  const { protocol, hostname } = window.location;
+  // file:// — страница открыта двойным кликом, хоста нет.
+  if (protocol === 'file:' || !hostname) return 'http://localhost:8000';
+  return `${protocol}//${hostname}:8000`;
+})();
+
+const API_URL    = `${API_BASE}/chat`;
 const HEALTH_URL = `${API_BASE}/health`;
 
-const REQUEST_TIMEOUT_MS = 90_000;
+// Бэкенд обращается к модели дважды (генерация SQL + объяснение результата),
+// а при ошибке СУБД делает ещё одну попытку исправить запрос — итого до трёх
+// вызовов. При LLM_TIMEOUT_S=20 и одном повторе худший случай около 125 с,
+// поэтому браузер ждёт с запасом. Меняете здесь — сверьтесь с LLM_TIMEOUT_S
+// и LLM_RETRIES в .env.
+const REQUEST_TIMEOUT_MS = 150_000;
 const HEALTH_EVERY_MS    = 25_000;
 const SESSION_KEY        = 'assistant:session';
 
@@ -50,6 +74,8 @@ const dom = {
   chatScreen:  $('chatScreen'),
   thread:      $('thread'),
   intro:       $('intro'),
+  introList:   $('introList'),
+  introPolicy: $('introPolicy'),
   loader:      $('loader'),
   composer:    $('composer'),
   input:       $('messageInput'),
@@ -57,6 +83,7 @@ const dom = {
 
   session:     $('session'),
   sessionUser: $('sessionUser'),
+  sessionRole: $('sessionRole'),
   logoutBtn:   $('logoutBtn'),
   status:      $('status'),
   statusText:  $('statusText')
@@ -196,15 +223,112 @@ function showAuth() {
   dom.login.focus();
 }
 
+/* ═══ 5a. ПРИВЕТСТВЕННЫЕ ПОДСКАЗКИ ═══════════════════════════════════
+ *
+ * Набор доступных данных зависит от роли: студенту закрыт контингент,
+ * преподавателю — поимённая успеваемость, приёмная статистика есть только у
+ * администрации. Предлагать всем один список значит гарантированно показать
+ * части пользователей отказ проверки безопасности вместо ответа.
+ *
+ * Роль приходит с бэкенда и здесь используется ТОЛЬКО для оформления. Доступ
+ * решает сервер по проверенному токену: подмена роли в localStorage меняет
+ * подсказки и ничего больше.
+ */
+const INTRO = {
+  student: {
+    items: [
+      'Какие институты и факультеты есть в ИГУ?',
+      'Что сдавать на прикладную информатику?',
+      'До какого числа подавать документы в 2026 году?',
+      'Какая у меня следующая пара?'
+    ],
+    policy: 'Направления, вступительные испытания и сроки приёма — по ' +
+            'данным приёмной кампании 2026 года. Свои оценки и расписание ' +
+            'видите только вы.'
+  },
+  teacher: {
+    items: [
+      'Что я веду в этом семестре?',
+      'Какой процент студентов сдал «Базы данных» с первой попытки?',
+      'Какое у меня расписание завтра?',
+      'Какие аудитории свободны в понедельник на второй паре?'
+    ],
+    policy: 'Успеваемость по дисциплинам показывается обезличенно: ' +
+            'распределение оценок и доли, без фамилий студентов.'
+  },
+  'deans-office': {
+    items: [
+      'Покажи топ-5 студентов по среднему баллу',
+      'Сколько должников на кафедре программной инженерии?',
+      'Какие преподаватели не ведут дисциплин в первом семестре?',
+      'Какие кафедры имеют средний балл ниже общего по университету?'
+    ],
+    policy: 'Деканату доступна поимённая успеваемость и задолженности. ' +
+            'Паспорта, телефоны, почты и даты рождения закрыты для всех ролей.'
+  },
+  administration: {
+    items: [
+      'Покажи динамику зачисления бюджетников по годам',
+      'Сколько заявлений подано за последние 7 дней кампании 2025 года?',
+      'Какой средний балл ЕГЭ по информатике у поступавших?',
+      'Соотношение бюджетных и платных мест по направлениям в 2026 году'
+    ],
+    policy: 'Статистика приёма выводится обезличенно: даты, статусы и ' +
+            'счётчики. Контакты абитуриентов недоступны ни одной роли.'
+  }
+};
+
+// Служебные имена ролей приходят с бэкенда как есть; для шапки нужны
+// человеческие.
+const ROLE_TITLE = {
+  student: 'студент',
+  teacher: 'преподаватель',
+  'deans-office': 'деканат',
+  administration: 'администрация'
+};
+
+const INTRO_DEFAULT = {
+  items: [
+    'Какие институты и факультеты есть в ИГУ?',
+    'Какие документы нужны для поступления?',
+    'Чем минимальный балл отличается от проходного?',
+    'Есть ли общежитие?'
+  ],
+  policy: 'Персональные данные студентов и абитуриентов не выводятся.'
+};
+
+function renderIntro(role) {
+  const preset = INTRO[role] || INTRO_DEFAULT;
+  const items = preset.items.map((text) => {
+    const button = document.createElement('button');
+    button.className = 'intro__item';
+    button.type = 'button';
+    button.textContent = text;
+    const li = document.createElement('li');
+    li.append(button);
+    return li;
+  });
+  dom.introList.replaceChildren(...items);
+  dom.introPolicy.textContent = preset.policy;
+}
+
 function showChat(user, token, role) {
   state.user = user;
   state.token = token || null;
   state.role = role || null;
+  renderIntro(state.role);
   dom.body.dataset.screen = 'chat';
   dom.authScreen.hidden = true;
   dom.chatScreen.hidden = false;
   dom.session.hidden = false;
   dom.sessionUser.textContent = user;
+
+  const roleTitle = ROLE_TITLE[state.role] || state.role;
+  dom.sessionRole.textContent = roleTitle || '';
+  dom.sessionRole.hidden = !roleTitle;
+  dom.sessionRole.title = roleTitle
+    ? `Роль определяет, какие данные доступны. Проверяется на сервере по токену.`
+    : '';
 
   setStatus('checking');
   checkHealth();
@@ -499,30 +623,121 @@ function renderSqlBlock(sql) {
   return { node: box, info };
 }
 
+/* ═══ 9a. ССЫЛКИ НА ИСТОЧНИКИ ═════════════════════════════════════════
+ *
+ * Служебные колонки приезжают из выборки одинаковыми во всех строках, а URL
+ * источника занимает под сотню символов и разносит вёрстку таблицы вширь.
+ *
+ * Поэтому колонка, у которой значение одно на всю выборку, выносится из
+ * таблицы под неё: показывается один раз и как подпись, а не как данные.
+ * Если значения различаются — колонка остаётся на месте, потому что тогда
+ * это уже содержательный признак строки.
+ *
+ * data_status в подписи не показывается: это внутренняя пометка загрузчиков
+ * данных, пользователю она не адресована. Из таблицы её убираем, наружу не
+ * выносим.
+ */
+const HIDDEN_COLUMNS = new Set(['data_status']);
+const LIFTABLE = new Set(['source_url', 'source', 'page_url', 'site_url']);
+
+function isUrl(value) {
+  return /^https?:\/\/\S+$/i.test(value);
+}
+
+/** Значение колонки, если оно одно на всю выборку; иначе null. */
+function constantValue(table, index) {
+  const first = table.rows[0]?.[index];
+  if (first === undefined || first === '') return null;
+  return table.rows.every((r) => r[index] === first) ? first : null;
+}
+
+/** Короткая подпись для ссылки: имя файла или домен. */
+function linkLabel(url) {
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split('/').filter(Boolean).pop();
+    if (last && /\.(pdf|docx?|xlsx?)$/i.test(last)) return last;
+    return parsed.hostname.replace(/^www\./, '');
+  } catch {
+    return 'источник';
+  }
+}
+
+function renderLink(url, label) {
+  const a = el('a', 'src-link', label || linkLabel(url));
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.title = url;
+  return a;
+}
+
+/** Подпись под таблицей со ссылкой на официальную страницу. */
+function renderProvenance(lifted) {
+  if (!lifted.length) return null;
+  const strip = el('p', 'provenance');
+  lifted.forEach(({ column, value }) => {
+    if (isUrl(value)) {
+      strip.appendChild(renderLink(value, `источник: ${linkLabel(value)}`));
+    } else {
+      strip.appendChild(el('span', 'provenance__note', `${column}: ${value}`));
+    }
+  });
+  return strip;
+}
+
 function renderTable(table) {
+  // Выносим постоянные служебные колонки, а таблицу строим по оставшимся.
+  const lifted = [];
+  const keep = [];
+  table.columns.forEach((column, index) => {
+    const name = String(column).trim().toLowerCase();
+    // Служебная колонка — просто не показываем.
+    if (HIDDEN_COLUMNS.has(name)) return;
+    if (LIFTABLE.has(name) && table.rows.length > 0) {
+      const value = constantValue(table, index);
+      if (value !== null) {
+        lifted.push({ column: name, value });
+        return;
+      }
+    }
+    keep.push(index);
+  });
+  // Если выносить пришлось всё — оставляем таблицу как есть, пустая
+  // бессмысленна.
+  const columns = keep.length ? keep.map((i) => table.columns[i]) : table.columns;
+  const rows = keep.length
+    ? table.rows.map((r) => keep.map((i) => r[i]))
+    : table.rows;
+
   const wrap = el('div', 'result-table');
   const t = el('table');
 
   const thead = el('thead');
   const headRow = el('tr');
-  table.columns.forEach((c) => headRow.appendChild(el('th', null, c)));
+  columns.forEach((c) => headRow.appendChild(el('th', null, c)));
   thead.appendChild(headRow);
   t.appendChild(thead);
 
   // Колонка числовая, если числом является большинство значений
-  const numericCol = table.columns.map((_, k) => {
-    const vals = table.rows.map((r) => r[k]).filter((v) => v !== '');
+  const numericCol = columns.map((_, k) => {
+    const vals = rows.map((r) => r[k]).filter((v) => v !== '');
     return vals.length > 0 && vals.filter(isNumeric).length / vals.length >= 0.7;
   });
 
   const tbody = el('tbody');
-  table.rows.forEach((row) => {
+  rows.forEach((row) => {
     const tr = el('tr');
     row.forEach((cell, k) => {
       const td = el('td');
       if (cell === '') {
         td.className = 'is-null';
         td.textContent = '—';
+      } else if (isUrl(cell)) {
+        // Ссылка целиком — это 100+ символов в одной ячейке; таблица от
+        // такого расползается на несколько экранов вширь.
+        td.className = 'is-link';
+        td.appendChild(renderLink(cell));
       } else {
         if (numericCol[k]) td.className = 'is-num';
         td.textContent = cell;
@@ -536,19 +751,41 @@ function renderTable(table) {
   wrap.appendChild(t);
 
   const meta = el('div', 'result-meta');
-  const n = table.rows.length;
+  const n = rows.length;
   meta.appendChild(el('span', null,
-    `${n} ${plural(n, 'строка', 'строки', 'строк')} · ${table.columns.length} ${plural(table.columns.length, 'колонка', 'колонки', 'колонок')}`));
+    `${n} ${plural(n, 'строка', 'строки', 'строк')} · ${columns.length} ${plural(columns.length, 'колонка', 'колонки', 'колонок')}`));
 
   const csv = el('button', 'result-meta__csv', 'Скачать CSV');
   csv.type = 'button';
+  // Выгружаем ИСХОДНУЮ таблицу со всеми колонками: в файле служебные поля
+  // нужны, это не про экономию места на экране.
   csv.addEventListener('click', () => downloadCsv(table));
   meta.appendChild(csv);
 
   const block = document.createDocumentFragment();
+  const provenance = renderProvenance(lifted);
+  if (provenance) block.appendChild(provenance);
   block.appendChild(wrap);
   block.appendChild(meta);
   return block;
+}
+
+/** Кнопка «скопировать ответ». Текст уходит в буфер без разметки. */
+function renderCopyAction(text) {
+  const button = el('button', 'msg__action', 'Скопировать ответ');
+  button.type = 'button';
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = 'Скопировано';
+    } catch {
+      // Буфер обмена недоступен без https и без разрешения — не повод
+      // показывать ошибку, достаточно честно сказать, что не вышло.
+      button.textContent = 'Не удалось скопировать';
+    }
+    setTimeout(() => { button.textContent = 'Скопировать ответ'; }, 2000);
+  });
+  return button;
 }
 
 /** Реплика в ленте: микро-лейбл говорящего и содержимое под ним. */
@@ -559,7 +796,16 @@ function addMessage(who, payload) {
   const article = el('article', `msg msg--${kind}`);
 
   const label = kind === 'user' ? (state.user || 'вы') : (kind === 'error' ? 'ошибка' : 'ассистент');
-  article.appendChild(el('p', 'msg__who', label));
+  const head = el('p', 'msg__who');
+  head.appendChild(el('span', 'msg__author', label));
+  // Время реплики. В длинной ленте без него непонятно, какой ответ свежий,
+  // а на защите — сколько заняли те самые два обращения к модели.
+  const time = new Date();
+  const stamp = el('time', 'msg__time',
+    time.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
+  stamp.dateTime = time.toISOString();
+  head.appendChild(stamp);
+  article.appendChild(head);
 
   if (typeof payload === 'string') {
     article.appendChild(renderProse(payload));
@@ -587,6 +833,20 @@ function addMessage(who, payload) {
     if (!payload.text && !payload.sql && !payload.table) {
       article.appendChild(renderProse('Сервер вернул пустой ответ. Попробуйте переформулировать вопрос.'));
     }
+
+    // Копировать имеет смысл ответ, а не текст ошибки.
+    if (kind === 'bot' && payload.text) {
+      article.appendChild(renderCopyAction(payload.text));
+    }
+  }
+
+  // Ошибка сети или таймаут — почти всегда лечится повтором того же вопроса.
+  // Заставлять человека перенабирать его руками незачем.
+  if (kind === 'error' && payload && payload.retry) {
+    const again = el('button', 'msg__action', 'Повторить вопрос');
+    again.type = 'button';
+    again.addEventListener('click', () => send(payload.retry));
+    article.appendChild(again);
   }
 
   dom.thread.appendChild(article);
@@ -661,7 +921,9 @@ async function send(question) {
       ? `Ассистент не ответил за ${Math.round(REQUEST_TIMEOUT_MS / 1000)} секунд. Возможно, запрос слишком тяжёлый — попробуйте сузить его фильтрами.`
       : `Не удалось связаться с ассистентом: ${err.message}. Проверьте, что бэкенд запущен на ${API_BASE}.`;
 
-    addMessage('error', reason);
+    // retry несёт исходный вопрос: сеть и таймаут лечатся повтором, и
+    // перенабирать текст руками человеку незачем.
+    addMessage('error', { text: reason, retry: q });
   } finally {
     clearTimeout(timer);
     setBusy(false);
@@ -745,9 +1007,12 @@ function bindEvents() {
     send(dom.input.value);
   });
 
-  // Быстрые вопросы из приветственного блока
-  dom.intro.querySelectorAll('.intro__item').forEach((btn) => {
-    btn.addEventListener('click', () => send(btn.textContent));
+  // Быстрые вопросы из приветственного блока. Обработчик висит на списке, а
+  // не на кнопках: кнопки создаются заново под роль при каждом входе
+  // (renderIntro), и подписка на конкретные элементы отвалилась бы сразу.
+  dom.introList.addEventListener('click', (event) => {
+    const button = event.target.closest('.intro__item');
+    if (button) send(button.textContent);
   });
 
   window.addEventListener('online',  checkHealth);

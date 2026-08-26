@@ -55,9 +55,9 @@ def test_whitelist_rejects_schema_qualified_references():
 def test_whitelist_rejects_comma_join_bypass():
     # Историческая дыра: старый regex видел только первую таблицу после FROM,
     # поэтому вторая таблица через запятую проходила проверку целиком.
-    assert _rejects("SELECT u.* FROM faculties f, auth.users u")
-    assert _rejects("SELECT s.* FROM faculties f, assistant.students s")
-    assert _rejects("SELECT * FROM faculties, students")
+    assert _rejects("SELECT u.* FROM university_units f, auth.users u")
+    assert _rejects("SELECT s.* FROM university_units f, assistant.students s")
+    assert _rejects("SELECT * FROM university_units, students")
 
 
 def test_whitelist_rejects_quoted_identifier():
@@ -74,8 +74,7 @@ def test_whitelist_accepts_students_summary():
         "SELECT SUM(student_count) FROM students_summary WHERE status = 'учится'"
     )
     security._assert_whitelist_tables(
-        "SELECT SUM(s.student_count) FROM students_summary s "
-        "JOIN programs p ON p.faculty_id = s.faculty_id"
+        "SELECT count(*) FROM schedule s JOIN groups g ON g.id = s.group_id"
     )
 
 
@@ -110,9 +109,29 @@ def test_roles_gate_aggregated_views():
 
 def test_base_tables_available_to_everyone():
     for role in security.ALLOWED_TABLES_BY_ROLE:
-        assert not _rejects_for("SELECT * FROM faculties", role)
+        assert not _rejects_for("SELECT * FROM teachers", role)
         assert not _rejects_for(
             "SELECT weekday, pair_number FROM schedule", role)
+
+
+def test_demo_structure_tables_are_hidden_from_the_model():
+    # faculties, programs и departments — демонстрационный контур: пять
+    # выдуманных факультетов и тринадцать направлений. Пока они видны модели,
+    # вопрос «сколько факультетов в ИГУ» отвечается «пять» вместо пятнадцати.
+    # Таблицы остаются в базе и работают, но SQL к ним модель не строит.
+    for table in ("faculties", "programs", "departments"):
+        for role in security.ALLOWED_TABLES_BY_ROLE:
+            assert _rejects_for(f"SELECT * FROM {table}", role), (
+                f"{table} не должна быть доступна роли {role}"
+            )
+
+
+def test_university_structure_comes_from_the_official_catalogue():
+    # Замена закрытым таблицам: официальные подразделения и направления.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        assert not _rejects_for("SELECT count(*) FROM university_units", role)
+        assert not _rejects_for(
+            "SELECT code, name FROM edu_programs WHERE level = 'бакалавриат'", role)
 
 
 def test_personal_views_only_for_student():
@@ -131,6 +150,179 @@ def test_teacher_views_only_for_teacher():
         assert not _rejects_for(sql, "teacher")
         for role in ("student", "deans-office", "administration"):
             assert _rejects_for(sql, role), f"{role} не должен видеть {sql}"
+
+
+def test_official_reference_available_to_everyone():
+    # Официальный справочник ИГУ (миграции 006/008) — публичные сведения:
+    # структура вуза, вступительные испытания, сроки, стоимость. Ограничивать
+    # их по ролям незачем, абитуриент заходит под той же учёткой.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        for sql in (
+            "SELECT official_name FROM university_units",
+            "SELECT program_name, budget_seats FROM programs_admission",
+            "SELECT subject, min_score FROM minimum_scores_view",
+            "SELECT program_name, passing_score FROM passing_scores_view",
+            "SELECT stage, date_to FROM admission_deadlines",
+            "SELECT doc_name FROM admission_documents",
+            "SELECT name, provided_to FROM dormitories",
+            "SELECT question, answer FROM faq_entries",
+            "SELECT lesson_date, subject_name FROM schedule_calendar",
+        ):
+            assert not _rejects_for(sql, role), f"{role} должен видеть: {sql}"
+
+
+def test_public_contacts_survive_the_personal_data_filter():
+    # FORBIDDEN_COLUMNS ищет 'phone' и 'email' по всему тексту запроса, поэтому
+    # колонки контактов названы contact_phone/contact_email. Если кто-то
+    # переименует их обратно, этот тест сломается раньше, чем демо.
+    assert not _rejects_for(
+        "SELECT title, contact_phone, contact_email FROM contacts", "student"
+    )
+    assert not _rejects_for(
+        "SELECT name, contact_phone FROM dormitories", "student"
+    )
+
+
+def test_personal_data_columns_are_still_forbidden():
+    # Ослабления чёрного списка не произошло: настоящие персональные данные
+    # закрыты по-прежнему.
+    for column in ("phone", "email", "passport", "birth_date"):
+        assert _rejects_for(f"SELECT {column} FROM students", "administration"), (
+            f"колонка {column} должна оставаться запрещённой"
+        )
+
+
+def test_schedule_quality_views_are_for_the_deans_office():
+    # Студенту нужно расписание, а не список пересечений в нём.
+    for sql in ("SELECT * FROM schedule_conflicts_group",
+                "SELECT * FROM schedule_conflicts_teacher",
+                "SELECT * FROM schedule_conflicts_room",
+                "SELECT * FROM schedule_issues"):
+        assert _rejects_for(sql, "student")
+        assert _rejects_for(sql, "teacher")
+        assert not _rejects_for(sql, "deans-office")
+        assert not _rejects_for(sql, "administration")
+
+
+def test_named_student_data_is_limited_to_the_deans_office():
+    # student_rankings и academic_debts показывают ФИО студентов. Это
+    # осознанное расширение прав деканата, а не дыра — и оно не должно
+    # расползтись на студента и преподавателя.
+    for sql in ("SELECT last_name, avg_score FROM student_rankings",
+                "SELECT last_name, debts_count FROM academic_debts"):
+        assert _rejects_for(sql, "student")
+        assert _rejects_for(sql, "teacher")
+        assert not _rejects_for(sql, "deans-office")
+        assert not _rejects_for(sql, "administration")
+
+
+def test_anonymous_analytics_is_open_wider():
+    # Обезличенная успеваемость по дисциплинам нужна преподавателю.
+    assert _rejects_for("SELECT * FROM subject_performance", "student")
+    assert not _rejects_for("SELECT * FROM subject_performance", "teacher")
+
+    # Аудитории и учебные планы не содержат ничего личного — доступны всем.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        assert not _rejects_for(
+            "SELECT building, room_number FROM room_availability "
+            "WHERE is_free AND weekday = 1 AND pair_number = 2", role)
+        assert not _rejects_for("SELECT * FROM room_load", role)
+        assert not _rejects_for("SELECT * FROM group_curriculum", role)
+
+
+def test_admission_statistics_stay_with_administration():
+    for sql in ("SELECT * FROM applications_by_day",
+                "SELECT * FROM admission_dynamics"):
+        for role in ("student", "teacher", "deans-office"):
+            assert _rejects_for(sql, role)
+        assert not _rejects_for(sql, "administration")
+
+
+def test_applicant_contacts_are_unreachable_for_everyone():
+    # «Покажи контакты абитуриента с лучшим баллом» не должно работать ни у
+    # кого: applications закрыта, а её обезличенные срезы полей связи не несут.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        assert _rejects_for("SELECT applicant_name, phone FROM applications", role)
+        assert _rejects_for("SELECT applicant_name, email FROM applications", role)
+        assert _rejects_for("SELECT * FROM ege_scores", role)
+
+
+def test_write_and_ddl_attempts_are_rejected():
+    # Прямые попытки изменить данные и служебные запросы к каталогу.
+    for sql in (
+        "UPDATE grades SET score = 5 WHERE enrollment_id = 1",
+        "INSERT INTO students (last_name) VALUES ('Иванов')",
+        "DELETE FROM students WHERE id = 1",
+        "SELECT * FROM university_units; DROP TABLE students; --",
+        "SELECT count(*) FROM students; DROP TABLE students",
+        "SELECT * FROM information_schema.columns",
+        "SELECT * FROM pg_catalog.pg_tables",
+        "SELECT set_config('app.student_id', '999', false)",
+        "SELECT current_setting('app.student_id')",
+        "SELECT pg_sleep(10) FROM university_units",
+    ):
+        for role in security.ALLOWED_TABLES_BY_ROLE:
+            assert _rejects_for(sql, role), f"должно отклоняться: {sql}"
+
+
+def test_rejections_are_explained_in_plain_language():
+    # Пользователь спрашивает «обнови мою оценку», а видит «Не удалось
+    # определить таблицу в запросе» — это ответ не на его вопрос. Причина
+    # отказа понятная, и сказать её надо словами.
+    def explain(sql, role="student"):
+        try:
+            security.validate_sql(sql, role)
+        except security.SQLSecurityError as e:
+            return security.explain_rejection(e)
+        raise AssertionError(f"должно было отклониться: {sql}")
+
+    assert "только на чтение" in explain("UPDATE grades SET score = 5")
+    assert "только на чтение" in explain("DELETE FROM students WHERE id = 1")
+    assert "только на чтение" in explain(
+        "SELECT * FROM teachers; DROP TABLE students")
+    assert "администратор" in explain(
+        "SELECT * FROM student_rankings", "student")
+    assert "закрыты для всех ролей" in explain(
+        "SELECT passport FROM my_profile", "student")
+    assert "произвольный текст" in explain(
+        "SELECT * FROM faq_entries WHERE {user_input}")
+
+    # Технический текст сохраняется для лога аудита — подменяется только то,
+    # что уходит пользователю.
+    try:
+        security.validate_sql("UPDATE grades SET score = 5", "student")
+    except security.SQLSecurityError as e:
+        assert "SELECT" in str(e)
+
+
+def test_quotes_and_wildcards_in_literals_are_safe():
+    # Апостроф в имени и процент в шаблоне — обычные данные, а не инъекция:
+    # запрос должен пройти, а не упасть и не быть отклонённым.
+    assert not _rejects_for(
+        "SELECT full_name FROM teachers WHERE full_name LIKE '%Д''Артаньян%'",
+        "student")
+    assert not _rejects_for(
+        "SELECT name FROM subjects WHERE name LIKE '%\\%%'", "student")
+
+
+def test_limit_is_enforced_on_unbounded_queries():
+    # «Выведи вообще все оценки за всю историю» не должно выгружать базу.
+    bounded = security.validate_sql("SELECT * FROM subject_performance", "teacher")
+    assert "LIMIT" in bounded.upper()
+    capped = security.validate_sql(
+        "SELECT * FROM subject_performance LIMIT 100000", "teacher")
+    assert f"LIMIT {security.MAX_LIMIT}" in capped
+
+
+def test_auth_schema_still_closed_after_widening_the_whitelist():
+    # Whitelist заметно расширился — проверяем, что дыра при этом не открылась.
+    for role in security.ALLOWED_TABLES_BY_ROLE:
+        assert _rejects_for("SELECT * FROM auth.users", role)
+        assert _rejects_for("SELECT * FROM users", role)
+        assert _rejects_for("SELECT * FROM students", role)
+        assert _rejects_for(
+            "SELECT u.* FROM university_units f, auth.users u", role
+        )
 
 
 def test_personal_views_do_not_cross_roles():
@@ -223,7 +415,7 @@ def test_chat_path_transaction_is_read_only():
 
 def test_unknown_role_gets_nothing():
     # Подделанный или устаревший role в токене — отказ, а не полный доступ.
-    assert _rejects_for("SELECT * FROM faculties", "root")
+    assert _rejects_for("SELECT * FROM university_units", "root")
     assert security.allowed_tables_for("root") == set()
 
 
@@ -234,7 +426,7 @@ def test_set_config_is_blocked():
         "SELECT set_config('app.student_id','1',true) FROM my_profile", "student")
     assert _rejects_for(
         "SELECT current_setting('app.student_id') FROM my_profile", "student")
-    assert _rejects_for("SELECT pg_sleep(10) FROM faculties", "student")
+    assert _rejects_for("SELECT pg_sleep(10) FROM university_units", "student")
 
 
 def _current_user_status(authorization):

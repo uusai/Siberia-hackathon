@@ -39,6 +39,9 @@
 
     <nav class="topbar__session" id="session" hidden>
       <span class="topbar__user" id="sessionUser"></span>
+      <!-- Роль решает, какие данные видны. Показываем её явно: иначе отказ
+           «недоступно вашей роли» выглядит как поломка, а не как правило. -->
+      <span class="topbar__role" id="sessionRole" hidden></span>
       <span class="topbar__status" id="status" data-state="checking" title="Связь с сервером">
         <span class="topbar__dot" aria-hidden="true"></span>
         <span id="statusText">проверка</span>
@@ -105,17 +108,12 @@
       <p class="eyebrow">Начало диалога</p>
       <h2 class="intro__title">Спросите о данных<br>университета</h2>
 
-      <ul class="intro__list">
-        <li><button class="intro__item" type="button">Сколько студентов обучается на каждом факультете?</button></li>
-        <li><button class="intro__item" type="button">Какой средний балл ЕГЭ у поступивших в 2025 году?</button></li>
-        <li><button class="intro__item" type="button">Сколько бюджетных мест осталось?</button></li>
-        <li><button class="intro__item" type="button">Какая кафедра имеет наибольшую учебную нагрузку?</button></li>
-      </ul>
+      <!-- Подсказки и текст о доступе подставляются из script.js под роль
+           вошедшего: студенту незачем предлагать вопрос, на который его роль
+           всё равно получит отказ. -->
+      <ul class="intro__list" id="introList"></ul>
 
-      <p class="intro__policy">
-        Персональные данные студентов и абитуриентов не выводятся —
-        только агрегированные и обезличенные показатели.
-      </p>
+      <p class="intro__policy" id="introPolicy"></p>
     </section>
   </div>
 

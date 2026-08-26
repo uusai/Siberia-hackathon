@@ -48,6 +48,16 @@ SQL_PROMPTS: dict[str, str] = {
 }
 interpret_system_prompt = ai_agent.build_interpret_system_prompt()
 
+# Схема в промпт тянется из БД живьём, поэтому новая таблица увеличивает его
+# молча. Печатаем размер на старте: раздувание промпта проще заметить в логе
+# запуска, чем по деградации ответов на защите.
+for _role, _prompt in sorted(SQL_PROMPTS.items()):
+    print(
+        f"[prompt] {_role}: {len(_prompt)} символов, "
+        f"{len(security.allowed_tables_for(_role))} объектов БД",
+        file=sys.stderr,
+    )
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -80,6 +90,30 @@ async def _safe_log_audit(**kwargs) -> None:
 async def health():
     # Намеренно без авторизации: фронтенд пингует этот эндпоинт до логина.
     return {"status": "ok"}
+
+
+@app.get("/meta/data-status")
+async def data_status(current_user: dict = Depends(get_current_user)):
+    """Сводка «сколько данных официальных, а сколько демонстрационных».
+
+    Под авторизацией, как и /chat: эндпоинт служебный. Читает готовое
+    представление assistant.data_status_summary (миграция 008); если она ещё
+    не применена, честно отвечает, что сводка недоступна, а не падает.
+    """
+    try:
+        rows = await db.afetch_all(
+            "assistant",
+            "SELECT table_name, data_status, rows FROM data_status_summary "
+            "ORDER BY table_name, data_status",
+            read_only=True,
+        )
+    except Exception as e:
+        return {"available": False, "reason": str(e).strip()}
+
+    summary: dict[str, dict[str, int]] = {}
+    for table, status, count in rows:
+        summary.setdefault(table, {})[status] = count
+    return {"available": True, "tables": summary}
 
 
 @app.post("/auth/login", response_model=LoginResponse)
@@ -186,11 +220,40 @@ async def chat(
             llm_ms=llm_ms,
             model=ai_agent.MODEL_NAME,
         )
-        return ChatResponse(answer=f"[Запрос отклонён проверкой безопасности] {e}", sql=sql)
+        # Пользователю — объяснение словами, в audit_log — точная причина
+        # отказа (она уже записана выше в reject_reason).
+        return ChatResponse(answer=security.explain_rejection(e), sql=sql)
 
     db_result = await security.aexecute_validated_sql(
         executed_sql, session_vars=session_vars
     )
+
+    # Одна попытка самоисправления. СУБД в ошибке называет проблему точно
+    # («column "semester" does not exist»), и модель по такой подсказке чинит
+    # запрос с первого раза. Без этого пользователь видел бы текст ошибки
+    # вместо ответа — при том, что нужная колонка есть в схеме прямо в
+    # промпте. Повтор ровно один: если и он не помог, дело не в опечатке.
+    if db_result.startswith("[Ошибка БД]"):
+        llm_start = time.monotonic()
+        retry_reply = await ai_agent.acall_gpt(
+            sql_system_prompt,
+            ai_agent.build_correction_input(user_input, sql, db_result),
+        )
+        llm_ms += int((time.monotonic() - llm_start) * 1000)
+        retry_sql = ai_agent.extract_sql(retry_reply)
+        if retry_sql:
+            try:
+                retry_executed = security.validate_sql(retry_sql, role)
+            except security.SQLSecurityError:
+                retry_executed = None
+            if retry_executed:
+                retry_result = await security.aexecute_validated_sql(
+                    retry_executed, session_vars=session_vars
+                )
+                if not retry_result.startswith("[Ошибка"):
+                    sql, executed_sql, db_result = (
+                        retry_sql, retry_executed, retry_result,
+                    )
 
     row_count = len(db_result.splitlines()) if db_result and not db_result.startswith("[Ошибка") else 0
 
