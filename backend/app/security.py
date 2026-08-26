@@ -1,6 +1,11 @@
 import os
 import re
-import subprocess
+
+import psycopg
+
+from . import db
+
+
 def _load_dotenv(path: str = ".env") -> None:
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -18,27 +23,40 @@ def _load_dotenv(path: str = ".env") -> None:
 _load_dotenv()
 
 
+# Whitelist таблиц и представлений схемы 'assistant', доступных чат-агенту.
+#
+# НИКОГДА не добавлять сюда auth.users (учётные записи и bcrypt-хеши паролей).
+# Через чат-путь эта таблица закрыта тремя независимыми слоями:
+#   1) чат-путь ходит в БД через пул со своим search_path=assistant (см.
+#      db.get_pool), поэтому неквалифицированное имя `users` не резолвится
+#      вообще — в схеме assistant таблицы users не существует;
+#   2) этот whitelist: в нём нет ни `users`, ни любой другой таблицы схемы auth;
+#   3) _assert_whitelist_tables(): отклоняет ссылки со схемой (auth.users,
+#      public.users), в двойных кавычках и перечисленные через запятую в FROM.
+# Дополнительно схема auth структурно невидима для ai_agent.get_db_schema() и
+# get_db_relationships() — обе фильтруют table_schema = 'assistant', так что
+# auth.users не попадает даже в промпт модели.
+# Отдельно про ege_scores: сырая таблица сюда НЕ добавляется никогда.
+# В ней есть application_id — внешний ключ в applications, где лежат ФИО,
+# паспорт, телефон и почта абитуриента. Даже без JOIN'а сам факт «заявление
+# №N набрало 98 по химии» вместе с любой другой утечкой по applications
+# позволяет опознать человека. Агенту доступно только агрегированное
+# ege_scores_summary — тот же приём, что со students_summary.
 ALLOWED_TABLES = {
-    "faculties", "departments", "programs", "curricula", "curriculum",
-    "subjects", "teachers", "administration", "rooms", "schedule",
+    "faculties", "departments", "programs", "curriculum",
+    "subjects", "teachers", "rooms", "schedule",
     "groups", "admission_campaigns",
-    "admissions_stats",
-    "students_summary", "applications_summary",
-    "grades_summary",
+    "students_summary", "applications_summary", "grades_summary",
+    "ege_scores_summary",
 }
 
-FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date"}
+FORBIDDEN_COLUMNS = {"passport", "phone", "birth_date", "email"}
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
 
-STATEMENT_TIMEOUT_MS = int(os.getenv("SQL_STATEMENT_TIMEOUT_MS", "5000"))
-
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+# Параметры подключения и statement_timeout теперь живут в db.py — здесь
+# остаётся только политика безопасности SQL.
 
 
 class SQLSecurityError(Exception):
@@ -71,16 +89,94 @@ def _assert_select_only(sql: str) -> None:
             )
 
 
+# Токен: идентификатор (возможно составной через точку и/или в двойных
+# кавычках), скобка, запятая либо любой другой непробельный кусок.
+_SQL_TOKEN_RE = re.compile(
+    r'"[^"]*"(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][A-Za-z0-9_$]*))*'
+    r'|[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][A-Za-z0-9_$]*))*'
+    r'|[(),]'
+    r'|[^\s(),]+'
+)
+
+# Слова, после которых перечисление таблиц в FROM заведомо закончилось.
+_TABLE_LIST_TERMINATORS = {
+    "where", "group", "order", "having", "limit", "offset", "union",
+    "intersect", "except", "on", "using", "join", "inner", "left",
+    "right", "full", "cross", "natural", "window", "fetch", "select",
+    "with", "and", "or",
+}
+
+
+def _extract_table_refs(sql: str) -> list[str]:
+    """Возвращает все ссылки на таблицы в позиции FROM/JOIN.
+
+    В отличие от простого `FROM\\s+(\\w+)`, учитывает:
+    - перечисление через запятую (FROM a, b): старый regex видел только `a`,
+      из-за чего `FROM faculties f, auth.users u` проходила whitelist;
+    - схему перед именем (auth.users): возвращается вместе с точкой, чтобы
+      вызывающий код мог отклонить такую ссылку явно, а не полагаться на то,
+      что regex «случайно» остановится перед точкой;
+    - идентификаторы в двойных кавычках ("students").
+
+    Подзапросы (FROM (SELECT ...)) пропускаются: их собственный FROM попадает
+    в разбор отдельно и проверяется на общих основаниях.
+
+    Известное ограничение (поведение не изменилось): имя CTE из
+    `WITH x AS (...) SELECT * FROM x` в whitelist не входит и будет отклонено.
+    Отказ в безопасную сторону — это осознанно.
+    """
+    # Строковые литералы вырезаем, иначе ILIKE '% from students %' дал бы
+    # ложное срабатывание.
+    sanitized = re.sub(r"'(?:[^']|'')*'", " '' ", sql)
+
+    refs: list[str] = []
+    state = "normal"
+    for token in _SQL_TOKEN_RE.findall(sanitized):
+        lowered = token.lower()
+
+        if state == "expect_table":
+            if token == "(":
+                state = "normal"          # производная таблица / подзапрос
+            elif token == ",":
+                pass
+            elif lowered in _TABLE_LIST_TERMINATORS:
+                state = "normal"
+            else:
+                refs.append(token)
+                state = "after_table"
+            continue
+
+        if state == "after_table":
+            if token == ",":
+                state = "expect_table"    # comma-join: дальше ещё таблица
+            elif lowered in ("from", "join"):
+                state = "expect_table"
+            elif lowered in _TABLE_LIST_TERMINATORS or token in ("(", ")"):
+                state = "normal"
+            # иначе это алиас (`t x` / `t AS x`) — остаёмся в after_table
+            continue
+
+        if lowered in ("from", "join"):
+            state = "expect_table"
+
+    return refs
+
+
 def _assert_whitelist_tables(sql: str) -> None:
-    pattern = re.compile(
-        r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?",
-        re.IGNORECASE,
-    )
-    found = pattern.findall(sql)
+    found = _extract_table_refs(sql)
     if not found:
         raise SQLSecurityError("Не удалось определить таблицу в запросе.")
 
     for table in found:
+        if "." in table:
+            raise SQLSecurityError(
+                f"Ссылки с указанием схемы запрещены: '{table}'. "
+                f"Обращайтесь к таблицам без префикса схемы."
+            )
+        if '"' in table:
+            raise SQLSecurityError(
+                f"Идентификаторы в двойных кавычках запрещены: {table}."
+            )
         if table.lower() not in ALLOWED_TABLES:
             raise SQLSecurityError(
                 f"Таблица '{table}' не входит в список разрешённых."
@@ -126,45 +222,42 @@ def validate_sql(sql: str) -> str:
     return _ensure_limit(normalized)
 
 
-def execute_sql(sql: str) -> str:
-    safe_sql = validate_sql(sql)
+def _format_value(value) -> str:
+    """Приводит значение к тому же виду, что раньше печатал psql -t -A.
 
-    env = os.environ.copy()
-    env["PGPASSWORD"] = DB_PASSWORD
-    env["PGOPTIONS"] = (
-        f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c search_path=assistant"
-    )
+    Формат важен: фронтенд разбирает строки вида «a|b|c», а модель во второй
+    фазе видит тот же текст. NULL у psql — пустая строка, булево — t/f.
+    """
+    if value is None:
+        return ""
+    if value is True:
+        return "t"
+    if value is False:
+        return "f"
+    return str(value)
 
+
+def execute_validated_sql(safe_sql: str) -> str:
+    """Выполняет УЖЕ ПРОВЕРЕННЫЙ SELECT-запрос.
+
+    Функция намеренно не вызывает validate_sql(): на вход подаётся ровно то,
+    что вернул validate_sql(). Раньше проверка шла дважды — здесь и у
+    вызывающего кода, которому safe_sql всё равно нужен для audit_log.
+
+    Возвращает строки в формате «поле|поле|поле», по строке на запись, — то
+    же, что раньше отдавал psql -t -A -F'|'. При ошибке возвращает текст,
+    начинающийся с «[Ошибка», — на это опирается main.py и фронтенд.
+    """
     try:
-        result = subprocess.run(
-            [
-                "psql",
-                "-h", DB_HOST,
-                "-p", str(DB_PORT),
-                "-U", DB_USER,
-                "-d", DB_NAME,
-                "-t",
-                "-A",
-                "-F", "|",
-                "-c", safe_sql,
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=30,
-        )
-    except FileNotFoundError as e:
-        return f"[Ошибка] psql не найден: {e}"
-    except subprocess.TimeoutExpired:
-        return "[Ошибка] Превышен таймаут выполнения процесса psql."
+        rows = db.fetch_all("assistant", safe_sql)
+    except db.DBUnavailable as e:
+        return f"[Ошибка БД] {e}"
+    except psycopg.Error as e:
+        # Ошибка самого запроса (несуществующая колонка, деление на ноль...):
+        # отдаём текст сервера, его вторая фаза объяснит пользователю.
+        return f"[Ошибка БД] {str(e).strip()}"
 
-    if result.returncode != 0:
-        return f"[Ошибка БД] {result.stderr.strip()}"
-
-    return result.stdout.strip()
-
-
-_AUDIT_NULL_SENTINEL = "\x01__AUDIT_NULL__\x01"
+    return "\n".join("|".join(_format_value(v) for v in row) for row in rows)
 
 
 def log_audit_entry(
@@ -180,64 +273,31 @@ def log_audit_entry(
     llm_ms: int,
     model: str,
 ) -> None:
-    def enc(value) -> str:
-        return _AUDIT_NULL_SENTINEL if value is None else str(value)
+    """Пишет запись в assistant.audit_log.
 
-    variables = {
-        "audit_username": enc(username),
-        "audit_role": enc(role),
-        "audit_question": enc(question),
-        "audit_generated_sql": enc(generated_sql),
-        "audit_executed_sql": enc(executed_sql),
-        "audit_verdict": enc(verdict),
-        "audit_reject_reason": enc(reject_reason),
-        "audit_row_count": enc(row_count),
-        "audit_duration_ms": enc(duration_ms),
-        "audit_llm_ms": enc(llm_ms),
-        "audit_model": enc(model),
-        "audit_null": _AUDIT_NULL_SENTINEL,
-    }
+    Значения уходят настоящими параметрами запроса (%s), а не подстановками
+    psql через -v/:'name'. Прежний вариант терял кириллицу: значения ехали
+    аргументами командной строки, Windows конвертировал их в ANSI-кодовую
+    страницу, и вопрос пользователя сохранялся как «??????» (len == bytes
+    в базе). Теперь текст доезжает как есть, а None становится NULL сам,
+    без sentinel-строки и NULLIF.
 
+    Пароли сюда не попадают: логируются только вопрос, SQL и метаданные.
+    """
     query = (
         "INSERT INTO assistant.audit_log "
         "(username, role, question, generated_sql, executed_sql, verdict, "
-        "reject_reason, row_count, duration_ms, llm_ms, model) VALUES ("
-        "NULLIF(:'audit_username', :'audit_null'), "
-        "NULLIF(:'audit_role', :'audit_null'), "
-        "NULLIF(:'audit_question', :'audit_null'), "
-        "NULLIF(:'audit_generated_sql', :'audit_null'), "
-        "NULLIF(:'audit_executed_sql', :'audit_null'), "
-        "NULLIF(:'audit_verdict', :'audit_null'), "
-        "NULLIF(:'audit_reject_reason', :'audit_null'), "
-        "NULLIF(:'audit_row_count', :'audit_null')::integer, "
-        "NULLIF(:'audit_duration_ms', :'audit_null')::integer, "
-        "NULLIF(:'audit_llm_ms', :'audit_null')::integer, "
-        "NULLIF(:'audit_model', :'audit_null')"
-        ");"
+        "reject_reason, row_count, duration_ms, llm_ms, model) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    params = (
+        username, role, question, generated_sql, executed_sql, verdict,
+        reject_reason, row_count, duration_ms, llm_ms, model,
     )
 
-    env = os.environ.copy()
-    env["PGPASSWORD"] = DB_PASSWORD
-    env["PGOPTIONS"] = "-c search_path=assistant"
-
-    cmd = [
-        "psql",
-        "-h", DB_HOST,
-        "-p", str(DB_PORT),
-        "-U", DB_USER,
-        "-d", DB_NAME,
-        "-v", "ON_ERROR_STOP=1",
-    ]
-    for key, value in variables.items():
-        cmd += ["-v", f"{key}={value}"]
-
-    result = subprocess.run(
-        cmd,
-        input=query,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+    try:
+        db.execute("assistant", query, params)
+    except db.DBUnavailable as e:
+        raise RuntimeError(f"БД недоступна: {e}") from e
+    except psycopg.Error as e:
+        raise RuntimeError(str(e).strip()) from e

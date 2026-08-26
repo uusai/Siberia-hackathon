@@ -3,10 +3,16 @@
    ───────────────────────────────────────────────────────────────────────
    Контракт с бэкендом поддержан в двух вариантах одновременно.
 
-   Запрос  POST /chat
-     { "message": "...", "question": "...", "role": null }
-     Оба поля шлются вместе: бэкенд читает то, которое знает,
-     лишнее pydantic отбрасывает сам.
+   Вход    POST /auth/login
+     { "username": "...", "password": "..." }
+     -> { access_token, token_type: "bearer", role }
+     Токен кладётся в state.token и в localStorage, живёт 8 часов.
+
+   Запрос  POST /chat            (требует Authorization: Bearer <token>)
+     { "message": "...", "question": "..." }
+     Оба имени поля шлются вместе: бэкенд читает то, которое знает,
+     лишнее pydantic отбрасывает сам. Роль в теле больше не передаётся —
+     бэкенд берёт её из токена, клиенту тут доверия нет.
 
    Ответ — принимается любой из двух форм:
      A) { response, sql?, data?, columns? }     ← основная спека
@@ -60,6 +66,8 @@ const dom = {
 
 const state = {
   user: null,
+  token: null,   // JWT из /auth/login, уходит в Authorization на /chat
+  role: null,    // роль с бэкенда; клиент ей не доверяет, она справочная
   busy: false,
   healthTimer: null
 };
@@ -97,42 +105,84 @@ function plural(n, one, few, many) {
 }
 
 /* ═══ 5. АВТОРИЗАЦИЯ ══════════════════════════════════════════════════
-   Клиентская заглушка: пускает по любой непустой паре. Когда на бэкенде
-   появится POST /login, заменяется тело signIn() — остальной код
-   трогать не придётся.
+   Настоящая авторизация против бэкенда: POST /auth/login отдаёт JWT,
+   он живёт в state.token и уходит заголовком Authorization на /chat.
+   Регистрации нет — учётки заводятся скриптом seed_auth_users.py.
    ═══════════════════════════════════════════════════════════════════ */
+
+const LOGIN_URL = `${API_BASE}/auth/login`;
 
 function loadSession() {
   try {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw);
-    return s && typeof s.user === 'string' && s.user ? s : null;
+    const valid = s && typeof s.user === 'string' && s.user
+                    && typeof s.token === 'string' && s.token;
+    return valid ? s : null;
   } catch {
     return null;
   }
 }
 
-function saveSession(user) {
+function saveSession(user, token, role) {
   try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ user, since: Date.now() }));
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ user, token, role, since: Date.now() })
+    );
   } catch {
     /* приватный режим — работаем без сохранения */
   }
 }
 
-function signIn(login, password) {
-  if (!login.trim() || !password.trim()) {
+/**
+ * Забирает у бэкенда токен.
+ * Поле в теле называется username — именно так его ждёт LoginRequest
+ * в main.py; при имени login FastAPI ответит 422, а не 401.
+ */
+async function signIn(login, password) {
+  const user = login.trim();
+  if (!user || !password.trim()) {
     return { ok: false, error: 'Введите логин и пароль.' };
   }
-  if (login.trim().length < 2) {
-    return { ok: false, error: 'Логин слишком короткий.' };
+
+  let res;
+  try {
+    res = await fetch(LOGIN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password })
+    });
+  } catch {
+    return {
+      ok: false,
+      error: `Нет связи с сервером. Проверьте, что бэкенд запущен на ${API_BASE}.`
+    };
   }
-  return { ok: true, user: login.trim() };
+
+  if (res.status === 401) return { ok: false, error: 'Неверный логин или пароль.' };
+  if (res.status === 503) return { ok: false, error: 'База данных недоступна, попробуйте ещё раз.' };
+  if (!res.ok) return { ok: false, error: `Сервер ответил ${res.status}. Попробуйте ещё раз.` };
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return { ok: false, error: 'Сервер вернул некорректный ответ.' };
+  }
+
+  if (!data || !data.access_token) {
+    return { ok: false, error: 'Сервер не выдал токен.' };
+  }
+
+  return { ok: true, user, token: data.access_token, role: data.role || null };
 }
 
 function showAuth() {
   state.user = null;
+  state.token = null;
+  state.role = null;
   dom.body.dataset.screen = 'auth';
   dom.authScreen.hidden = false;
   dom.chatScreen.hidden = true;
@@ -146,8 +196,10 @@ function showAuth() {
   dom.login.focus();
 }
 
-function showChat(user) {
+function showChat(user, token, role) {
   state.user = user;
+  state.token = token || null;
+  state.role = role || null;
   dom.body.dataset.screen = 'chat';
   dom.authScreen.hidden = true;
   dom.chatScreen.hidden = false;
@@ -565,11 +617,23 @@ async function send(question) {
   try {
     const res = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // /chat закрыт авторизацией: без Bearer-токена бэкенд ответит 401
+        'Authorization': `Bearer ${state.token || ''}`
+      },
       // Оба имени поля сразу — работает с любым из двух бэкендов
       body: JSON.stringify({ message: q, question: q }),
       signal: controller.signal
     });
+
+    // Токен истёк (JWT живёт 8 часов) либо недействителен — на экран входа
+    if (res.status === 401) {
+      setStatus('online');
+      addMessage('error', 'Сессия истекла. Войдите заново.');
+      logout();
+      return;
+    }
 
     if (!res.ok) throw new Error(`сервер ответил ${res.status} ${res.statusText}`.trim());
 
@@ -601,7 +665,8 @@ async function send(question) {
   } finally {
     clearTimeout(timer);
     setBusy(false);
-    dom.input.focus();
+    // После 401 мы уже на экране входа — фокус туда возвращать не надо
+    if (dom.body.dataset.screen === 'chat') dom.input.focus();
   }
 }
 
@@ -646,18 +711,27 @@ function downloadCsv(table) {
 /* ═══ 13. ИНИЦИАЛИЗАЦИЯ ══════════════════════════════════════════════ */
 
 function bindEvents() {
-  dom.authForm.addEventListener('submit', (e) => {
+  dom.authForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const result = signIn(dom.login.value, dom.password.value);
 
-    if (!result.ok) {
-      dom.authError.textContent = result.error;
-      dom.authError.hidden = false;
-      return;
-    }
+    // signIn теперь ходит по сети — блокируем кнопку на время запроса
+    const submitBtn = dom.authForm.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
     dom.authError.hidden = true;
-    saveSession(result.user);
-    showChat(result.user);
+
+    try {
+      const result = await signIn(dom.login.value, dom.password.value);
+
+      if (!result.ok) {
+        dom.authError.textContent = result.error;
+        dom.authError.hidden = false;
+        return;
+      }
+      saveSession(result.user, result.token, result.role);
+      showChat(result.user, result.token, result.role);
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
   });
 
   [dom.login, dom.password].forEach((field) => {
@@ -685,7 +759,7 @@ function init() {
   setBusy(false);
 
   const session = loadSession();
-  if (session) showChat(session.user);
+  if (session) showChat(session.user, session.token, session.role);
   else showAuth();
 }
 
