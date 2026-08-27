@@ -335,7 +335,7 @@ function showAuth() {
 const INTRO = {
   student: {
     items: [
-      'Какие институты и факультеты есть в ИГУ?',
+      'Какие институты и факультеты есть в университете?',
       'Что сдавать на прикладную информатику?',
       'До какого числа подавать документы в 2026 году?',
       'Какая у меня следующая пара?'
@@ -387,7 +387,7 @@ const ROLE_TITLE = {
 
 const INTRO_DEFAULT = {
   items: [
-    'Какие институты и факультеты есть в ИГУ?',
+    'Какие институты и факультеты есть в университете?',
     'Какие документы нужны для поступления?',
     'Чем минимальный балл отличается от проходного?',
     'Есть ли общежитие?'
@@ -777,18 +777,15 @@ function renderSqlBlock(sql) {
  * данных, пользователю она не адресована. Из таблицы её убираем, наружу не
  * выносим.
  */
-const HIDDEN_COLUMNS = new Set(['data_status']);
-const LIFTABLE = new Set(['source_url', 'source', 'page_url', 'site_url']);
+/* Обвязка внешних источников. Модель их больше не видит вовсе
+ * (ai_agent._PROVENANCE_COLUMNS), но список остаётся здесь второй линией:
+ * ассистент отвечает ПО БАЗЕ, и адресу PDF-файла в ответе не место. */
+const HIDDEN_COLUMNS = new Set([
+  'data_status', 'source_url', 'source_id', 'checked_at', 'page_url', 'site_url'
+]);
 
 function isUrl(value) {
   return /^https?:\/\/\S+$/i.test(value);
-}
-
-/** Значение колонки, если оно одно на всю выборку; иначе null. */
-function constantValue(table, index) {
-  const first = table.rows[0]?.[index];
-  if (first === undefined || first === '') return null;
-  return table.rows.every((r) => r[index] === first) ? first : null;
 }
 
 /** Короткая подпись для ссылки: имя файла или домен. */
@@ -812,38 +809,26 @@ function renderLink(url, label) {
   return a;
 }
 
-/** Подпись под таблицей со ссылкой на официальную страницу. */
-function renderProvenance(lifted) {
-  if (!lifted.length) return null;
-  const strip = el('p', 'provenance');
-  lifted.forEach(({ column, value }) => {
-    if (isUrl(value)) {
-      strip.appendChild(renderLink(value, `источник: ${linkLabel(value)}`));
-    } else {
-      strip.appendChild(el('span', 'provenance__note', `${column}: ${value}`));
-    }
-  });
-  return strip;
-}
+/* Подписи «источник: isu.ru» под таблицей здесь больше нет.
+ *
+ * Она выносила колонку source_url из выборки и показывала ссылку на PDF, с
+ * которого данные однажды загрузили. Ассистент отвечает ПО БАЗЕ ДАННЫХ, и
+ * отсылка к внешнему документу в ответе выглядела так, будто ответ взят с
+ * сайта. Сами колонки теперь скрыты и от модели, и из таблицы
+ * (HIDDEN_COLUMNS), выносить стало нечего.
+ *
+ * renderLink ниже остаётся: если URL всё-таки окажется в данных, показать
+ * его короткой ссылкой лучше, чем растянуть таблицу на сто символов вширь. */
 
 function renderTable(table) {
-  // Выносим постоянные служебные колонки, а таблицу строим по оставшимся.
-  const lifted = [];
+  // Служебные колонки в таблицу не попадают.
   const keep = [];
   table.columns.forEach((column, index) => {
     const name = String(column).trim().toLowerCase();
-    // Служебная колонка — просто не показываем.
     if (HIDDEN_COLUMNS.has(name)) return;
-    if (LIFTABLE.has(name) && table.rows.length > 0) {
-      const value = constantValue(table, index);
-      if (value !== null) {
-        lifted.push({ column: name, value });
-        return;
-      }
-    }
     keep.push(index);
   });
-  // Если выносить пришлось всё — оставляем таблицу как есть, пустая
+  // Если скрыть пришлось всё — оставляем таблицу как есть, пустая
   // бессмысленна.
   const columns = keep.length ? keep.map((i) => table.columns[i]) : table.columns;
   const rows = keep.length
@@ -903,8 +888,6 @@ function renderTable(table) {
   meta.appendChild(csv);
 
   const block = document.createDocumentFragment();
-  const provenance = renderProvenance(lifted);
-  if (provenance) block.appendChild(provenance);
   block.appendChild(wrap);
   block.appendChild(meta);
   return block;

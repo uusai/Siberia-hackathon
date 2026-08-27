@@ -204,6 +204,30 @@ button { font: inherit; color: inherit; cursor: pointer; }
   white-space: pre-wrap; word-break: break-word;
 }
 
+/* Разбор запроса: что взяли, как соединили, чем отфильтровали.
+   Пары «подпись — значение» в две колонки; подпись тише значения. */
+.sql-explain {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.sql-explain dt {
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  font-size: 9px;
+  color: var(--fg-30);
+  padding-top: 1px;
+}
+.sql-explain dd {
+  margin: 0;
+  color: var(--fg-70);
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
 .sql__copy {
   border: 0; background: transparent; padding: 0;
   font-size: 10px; letter-spacing: .1em; text-transform: uppercase;

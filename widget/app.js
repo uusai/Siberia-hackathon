@@ -7,9 +7,10 @@
 
    Вместо этого виджет берёт токен у POST /auth/guest — без пароля, роль
    `guest`. У этой роли в whitelist только официальный справочник приёма
-   (backend/app/security.py, _GUEST_TABLES): ни студентов, ни оценок, ни
-   расписания, ни контактов абитуриентов. То есть доступно ровно столько же,
-   сколько опубликовано на сайте ИГУ, и утечка такого токена ничего не даёт.
+   (backend/app/security.py, _GUEST_TABLES): справочник приёма, расписание
+   БЕЗ ФИО преподавателей, корпуса и аудитории. Ни студентов, ни оценок, ни
+   нагрузки. То есть доступно ровно столько же,
+   сколько вуз публикует открыто, и утечка такого токена ничего не даёт.
 
    Бэкенд ограничивает частоту по адресу — и выдачу токенов, и сами вопросы:
    каждый вопрос стоит обращения к платной модели.
@@ -21,8 +22,8 @@ var params = new URLSearchParams(location.search);
 var API = (params.get('api') || location.origin).replace(/\/+$/, '');
 var TITLE = params.get('title');
 
-var TOKEN_KEY = 'isu-widget:token';
-var THEME_KEY = 'isu-widget:theme';
+var TOKEN_KEY = 'assistant-widget:token';
+var THEME_KEY = 'assistant-widget:theme';
 // Бэкенд обращается к модели дважды за вопрос, при ошибке СУБД — трижды.
 // Значение согласовано с REQUEST_TIMEOUT_MS основного фронтенда.
 var TIMEOUT_MS = 150000;
@@ -182,6 +183,50 @@ function renderTable(table) {
  * генератора правдоподобного текста: ответ можно проверить, а не поверить.
  * На защите это же и показывают.
  */
+/**
+ * Разбор SQL на понятные части: что взяли, как соединили, чем отфильтровали.
+ *
+ * Считается ИЗ САМОГО ЗАПРОСА, на стороне клиента — модель к этому объяснению
+ * не привлекается вообще. Это важно: объяснение, сочинённое той же моделью,
+ * что писала запрос, ничего не подтверждает — она с равным успехом опишет и
+ * то, чего в запросе нет. Разбор текста запроса такой возможности не имеет.
+ *
+ * Тот же приём, что в основном интерфейсе (frontend/script.js, explainSql).
+ */
+function explainSql(sql) {
+  var flat = String(sql).replace(/\s+/g, ' ').trim();
+  var uniq = function (a) { return a.filter(function (v, i) { return a.indexOf(v) === i; }); };
+  var all = function (re) {
+    var out = [], m;
+    while ((m = re.exec(flat)) !== null) out.push(m);
+    return out;
+  };
+
+  var tables = uniq(all(/\b(?:from|join)\s+([a-z_][\w$]*)/gi).map(function (m) { return m[1]; }));
+  var joins = all(/\b(inner|left|right|full|cross)?\s*join\s+([a-z_][\w$]*)/gi)
+    .map(function (m) { return ((m[1] || '').toUpperCase() + ' JOIN ' + m[2]).trim(); });
+
+  var where = flat.match(/\bwhere\b(.+?)(?=\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|$)/i);
+  var filters = where
+    ? where[1].split(/\s+\b(?:and|or)\b\s+/i).map(function (f) { return f.trim(); })
+        .filter(Boolean).slice(0, 4)
+    : [];
+
+  var group = flat.match(/\bgroup\s+by\b\s+(.+?)(?=\border\s+by\b|\bhaving\b|\blimit\b|$)/i);
+  var aggregates = uniq(all(/\b(count|sum|avg|min|max|round)\s*\(/gi)
+    .map(function (m) { return m[1].toUpperCase(); }));
+  var limit = flat.match(/\blimit\s+(\d+)/i);
+
+  return {
+    tables: tables,
+    joins: joins,
+    filters: filters,
+    grouping: group ? group[1].trim() : null,
+    aggregates: aggregates,
+    limit: limit ? Number(limit[1]) : null
+  };
+}
+
 function renderSql(sql) {
   var box = el('details', 'sql');
   box.appendChild(el('summary', null, 'Показать SQL-запрос'));
@@ -189,6 +234,22 @@ function renderSql(sql) {
   var pre = el('pre');
   pre.appendChild(el('code', null, sql));
   box.appendChild(pre);
+
+  // Структурированное объяснение: какие таблицы, связи, фильтры и агрегаты.
+  var info = explainSql(sql);
+  var ex = el('dl', 'sql-explain');
+  var item = function (label, value) {
+    if (!value) return;
+    ex.appendChild(el('dt', null, label));
+    ex.appendChild(el('dd', null, value));
+  };
+  item('таблицы', info.tables.join(', '));
+  item('связи', info.joins.join(', '));
+  item('фильтры', info.filters.join('; '));
+  item('группировка', info.grouping);
+  item('агрегаты', info.aggregates.map(function (a) { return a + '()'; }).join(', '));
+  item('ограничение', info.limit != null ? 'LIMIT ' + info.limit : null);
+  if (ex.childElementCount) box.appendChild(ex);
 
   var copy = el('button', 'sql__copy', 'Скопировать');
   copy.type = 'button';
@@ -334,7 +395,7 @@ dom.hints.addEventListener('click', function (e) {
 var embedded = window.parent !== window;
 if (embedded) {
   dom.closeBtn.addEventListener('click', function () {
-    parent.postMessage({ type: 'isu:close' }, '*');
+    parent.postMessage({ type: 'assistant:close' }, '*');
   });
 } else {
   dom.closeBtn.hidden = true;
@@ -343,7 +404,7 @@ if (embedded) {
 
 // Загрузчик сообщает, что виджет раскрыли — ставим фокус в поле.
 window.addEventListener('message', function (event) {
-  if (event.data && event.data.type === 'isu:opened') dom.input.focus();
+  if (event.data && event.data.type === 'assistant:opened') dom.input.focus();
 });
 
 /* ── старт ───────────────────────────────────────────────────────── */

@@ -28,8 +28,8 @@
 
   var script = document.currentScript;
   if (!script) return;                       // подключили не тегом — уходим
-  if (window.__isuAssistantWidget) return;   // уже встроен
-  window.__isuAssistantWidget = true;
+  if (window.__universityAssistantWidget) return;   // уже встроен
+  window.__universityAssistantWidget = true;
 
   var base = new URL('.', script.src).href;
 
@@ -94,7 +94,7 @@
     frame.style.display = open ? 'block' : 'none';
     button.textContent = open ? 'Свернуть' : title;
     button.setAttribute('aria-expanded', String(open));
-    if (open) frame.contentWindow.postMessage({ type: 'isu:opened' }, '*');
+    if (open) frame.contentWindow.postMessage({ type: 'assistant:opened' }, '*');
   }
 
   button.addEventListener('click', function () { toggle(); });
@@ -103,7 +103,7 @@
   // сообщения от нашего же окна: чужие страницы шлют в window что угодно.
   window.addEventListener('message', function (event) {
     if (event.source !== frame.contentWindow) return;
-    if (event.data && event.data.type === 'isu:close') toggle(false);
+    if (event.data && event.data.type === 'assistant:close') toggle(false);
   });
 
   // Esc закрывает — привычно и не мешает странице-хозяину.

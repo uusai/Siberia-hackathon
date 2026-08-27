@@ -19,7 +19,11 @@ const source = fs.readFileSync(SCRIPT, 'utf8');
 
 // Вырезаем объявления нужных функций из скрипта. Загрузить его целиком нельзя:
 // на верхнем уровне он обращается к document и window.
-const NAMES = ['isUrl', 'constantValue', 'linkLabel'];
+// constantValue отсюда убран вместе с механизмом выноса колонки-источника
+// под таблицу: ассистент отвечает по базе, и подпись «источник: isu.ru» под
+// ответом выглядела так, будто данные взяты с сайта. Колонки происхождения
+// теперь скрыты и от модели, и из таблицы — выносить стало нечего.
+const NAMES = ['isUrl', 'linkLabel'];
 let extracted = '';
 for (const name of NAMES) {
   const match = source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n}`, 'm'));
@@ -60,19 +64,17 @@ check(
 check('страница', linkLabel('https://www.isu.ru/ru/university/structure/faculties/main/'), 'isu.ru');
 check('битый адрес', linkLabel('не ссылка'), 'источник');
 
-console.log('\nconstantValue — колонку выносим, только если значение одно:');
-const same = {
-  columns: ['program_name', 'source_url'],
-  rows: [['Лингвистика', 'https://isu.ru/1'], ['Инноватика', 'https://isu.ru/1']]
-};
-const different = {
-  columns: ['program_name', 'source_url'],
-  rows: [['Лингвистика', 'https://isu.ru/1'], ['Инноватика', 'https://isu.ru/2']]
-};
-check('одинаковое', constantValue(same, 1), 'https://isu.ru/1');
-check('разное остаётся в таблице', constantValue(different, 1), null);
-check('пустая выборка', constantValue({ columns: ['a'], rows: [] }, 0), null);
-check('пустое значение', constantValue({ columns: ['a'], rows: [['']] }, 0), null);
+console.log('\nHIDDEN_COLUMNS — обвязка источников в таблицу не попадает:');
+// Ассистент отвечает ПО БАЗЕ. Адрес PDF-файла, с которого данные однажды
+// загрузили, в ответе выглядел так, будто ответ взят с сайта. Модель эти
+// колонки уже не видит (ai_agent._PROVENANCE_COLUMNS), здесь вторая линия:
+// даже если они как-то придут, в таблицу они не попадут.
+const hiddenMatch = source.match(/const HIDDEN_COLUMNS = new Set\(\[([\s\S]*?)\]\)/);
+const hiddenList = hiddenMatch ? (hiddenMatch[1].match(/'[^']+'/g) || []).map((s) => s.slice(1, -1)) : [];
+['data_status', 'source_url', 'source_id', 'checked_at', 'page_url'].forEach((column) => {
+  check(`${column} скрыт`, hiddenList.includes(column), true);
+});
+check('содержательные колонки не трогаем', hiddenList.includes('program_name'), false);
 
 console.log(failures ? `\nНе пройдено: ${failures}` : '\nВсе проверки пройдены.');
 process.exit(failures ? 1 : 0);
